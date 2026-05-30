@@ -126,48 +126,12 @@ def screen_symbols():
     }
 
 
-def compute_allocations(
+def _compute_allocations_single(
     signals: pd.DataFrame,
-    method: str = "signal",
-    top_k: int | None = None,
-    long_only: bool = True,
+    method: str,
+    top_k: int | None,
+    long_only: bool,
 ) -> pd.DataFrame:
-    """
-    Convert per-asset signal strengths into portfolio weight allocations.
-
-    Parameters
-    ----------
-    signals : pd.DataFrame
-        Rows = timestamps, columns = assets, values = signal strengths.
-        NaN values are treated as no signal (zero allocation).
-    method : {'equal', 'signal', 'rank', 'inverse_rank'}
-        equal        — equal weight among selected assets
-        signal       — weight proportional to signal value
-        rank         — weight proportional to rank (weakest=1, strongest=N)
-        inverse_rank — weight proportional to 1/rank (strongest=rank 1 → weight 1,
-                       second=rank 2 → weight 1/2, etc.)
-    top_k : int or None
-        Restrict allocation to the top-k assets by signal strength.
-        If None, all assets with positive signal are eligible.
-    long_only : bool
-        If True (default), negative signals are floored to zero.
-        If False, absolute signal value is used for sizing; sign is preserved
-        and weights are normalised by the sum of absolute weights.
-
-    Returns
-    -------
-    pd.DataFrame
-        Same shape as signals. Each row sums to 1 in absolute value
-        (or 0 if no valid signals exist for that row).
-        Long-only: all values in [0, 1].
-        Long/short: values in [-1, 1], abs values sum to 1.
-    """
-    valid_methods = {"equal", "signal", "rank", "inverse_rank"}
-    if method not in valid_methods:
-        raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
-    if top_k is not None and top_k < 1:
-        raise ValueError("top_k must be >= 1")
-
     signals = signals.copy().fillna(0.0)
 
     def _allocate_row(row: pd.Series) -> pd.Series:
@@ -204,3 +168,90 @@ def compute_allocations(
         return result
 
     return signals.apply(_allocate_row, axis=1)
+
+
+def compute_allocations(
+    signals: pd.DataFrame,
+    method: str | list[str] = "signal",
+    top_k: int | list[int] | None = None,
+    long_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Convert per-asset signal strengths into portfolio weight allocations.
+
+    Parameters
+    ----------
+    signals : pd.DataFrame
+        Rows = timestamps, columns = assets, values = signal strengths.
+        NaN values are treated as no signal (zero allocation).
+    method : str or list of str
+        One of {'equal', 'signal', 'rank', 'inverse_rank'}, or a list of them
+        to sweep. When a list, the result has a 'method' MultiIndex level.
+    top_k : int, list of int, or None
+        Restrict allocation to the top-k assets by signal strength.
+        Pass a list to sweep; the result gains a 'top_k' MultiIndex level.
+        If None, all assets with positive signal are eligible.
+    long_only : bool
+        If True (default), negative signals are floored to zero.
+        If False, absolute signal value is used for sizing; sign is preserved
+        and weights are normalised by the sum of absolute weights.
+
+    Returns
+    -------
+    pd.DataFrame
+        Flat if both method and top_k are scalars (rows sum to 1).
+        MultiIndex columns when either is a list:
+          - top_k list only  → levels ['top_k', asset]
+          - method list only → levels ['method', asset]
+          - both lists       → levels ['method', 'top_k', asset]
+    """
+    valid_methods = {"equal", "signal", "rank", "inverse_rank"}
+
+    multi_method = isinstance(method, list)
+    multi_top_k = isinstance(top_k, list)
+
+    methods = method if multi_method else [method]
+    top_ks = top_k if multi_top_k else [top_k]
+
+    for m in methods:
+        if m not in valid_methods:
+            raise ValueError(f"method must be one of {valid_methods}, got '{m}'")
+    for k in top_ks:
+        if k is not None and k < 1:
+            raise ValueError("top_k must be >= 1")
+
+    if not multi_method and not multi_top_k:
+        return _compute_allocations_single(signals, methods[0], top_ks[0], long_only)
+
+    frames = {}
+    for m in methods:
+        for k in top_ks:
+            key = (m, k) if (multi_method and multi_top_k) else (m if multi_method else k)
+            frames[key] = _compute_allocations_single(signals, m, k, long_only)
+
+    result = pd.concat(frames, axis=1)
+
+    existing_names = list(signals.columns.names)
+    if multi_method and multi_top_k:
+        result.columns.names = ['method', 'top_k'] + existing_names
+    elif multi_method:
+        result.columns.names = ['method'] + existing_names
+    else:
+        result.columns.names = ['top_k'] + existing_names
+
+    return result
+
+def compact_view(alloc, combined=True):
+    def top_positions(row):
+        held = row[row > 0].sort_values(ascending=False)
+        idx = range(1, len(held) + 1)
+        tickers = pd.Series(held.index, index=idx)
+        weights = pd.Series(held.values, index=idx)
+        return tickers, weights
+
+    t, w = zip(*alloc.apply(top_positions, axis=1))
+    tickers = pd.DataFrame(list(t), index=alloc.index)
+    weights = pd.DataFrame(list(w), index=alloc.index)
+    if combined:
+            return tickers + ' (' + weights.map(lambda x: f'{x:.1%}' if pd.notna(x) else '') + ')'
+    return tickers, weights
