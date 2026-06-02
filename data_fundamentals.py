@@ -133,7 +133,11 @@ def _fetch_fields(tickers: list[str], fields: list[str], delay: float = 0.5, ret
 
     if not rows:
         return pd.DataFrame(columns=fields)
-    return pd.DataFrame(rows).set_index('ticker')
+    df = pd.DataFrame(rows).set_index('ticker')
+    # Coerce numeric columns and replace inf (e.g. trailingPE on loss-making stocks)
+    df = df.apply(pd.to_numeric, errors='ignore')
+    df = df.replace([float('inf'), float('-inf')], float('nan'))
+    return df
 
 
 def fundamentals(symbols: dict, specs: dict = FUNDAMENTALS_SPECS, force: bool = False) -> dict:
@@ -172,8 +176,58 @@ def fundamentals(symbols: dict, specs: dict = FUNDAMENTALS_SPECS, force: bool = 
     return results
 
 
-screen = screen_symbols()
+
+METADATA_PATH = Path('data/metadata.json')
 
 
-results = fundamentals(screen)
-print(results['equities']['daily'])
+def get_static_metadata(
+    symbols: dict | None = None,
+    force: bool = False,
+) -> dict:
+    """
+    Fetch the full yf.Ticker.info dict for all equities and ETFs and save to
+    data/metadata.json, keyed by ticker.
+
+    symbols : {'equities': [...], 'etfs': [...]} or None to use screen_symbols().
+    force   : re-fetch even if the file already exists.
+    """
+    if not force and METADATA_PATH.exists():
+        print(f'Loading cached metadata from {METADATA_PATH}')
+        with open(METADATA_PATH, encoding='utf-8') as f:
+            return json.load(f)
+
+    if symbols is None:
+        symbols = screen_symbols()
+
+    METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    metadata: dict = {}
+
+    for asset_class in ('equities', 'etfs'):
+        tickers = symbols.get(asset_class, [])
+        if not tickers:
+            continue
+        print(f'Fetching metadata for {len(tickers)} {asset_class}...')
+        for ticker in tqdm(tickers, desc=asset_class, unit='ticker'):
+            for attempt in range(3):
+                try:
+                    info = yf.Ticker(ticker).info
+                    info['asset_class'] = asset_class
+                    metadata[ticker] = info
+                    time.sleep(0.3)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(0.3 * 2 ** attempt)
+                    else:
+                        tqdm.write(f'  skipping {ticker}: {e}')
+
+    with open(METADATA_PATH, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, default=str)
+    print(f'Saved metadata for {len(metadata)} tickers to {METADATA_PATH}')
+    return metadata
+
+
+if __name__ == '__main__':
+    screen = screen_symbols()
+    results = fundamentals(screen)
+    print(results['equities']['daily'])

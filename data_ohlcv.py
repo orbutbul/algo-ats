@@ -46,7 +46,7 @@ def download_daily_1min(yf_symbols, crypto_symbols):
         if raw.empty:
             continue
         # stack() pivots the ticker column level into the row index
-        batch_df = raw.stack(level=0).rename_axis(['datetime', 'ticker'])
+        batch_df = raw.stack(level=0, future_stack=True).rename_axis(['datetime', 'ticker'])
         batch_df.columns = batch_df.columns.str.lower()
         frames.append(batch_df)
 
@@ -83,7 +83,7 @@ def download_daily_1min(yf_symbols, crypto_symbols):
     print(f'Saved {len(combined):,} rows to {OHLCV_PATH}')
 
 
-DAILY_PATH = Path('data/ohlcv_daily.parquet')
+DAILY_PATH = Path('data/ohlcv_max.parquet')
 
 
 def get_max_data(symbols: list[str] | None = None) -> None:
@@ -163,4 +163,36 @@ def get_max_data(symbols: list[str] | None = None) -> None:
     combined.to_parquet(DAILY_PATH)
     print(f'Saved {len(combined):,} rows ({combined.index.get_level_values("ticker").nunique():,} tickers) to {DAILY_PATH}')
 
+
+def upsert_new_symbol(symbol: str, max: bool = False, daily: bool = False) -> None:
+    """
+    Validate a symbol on yfinance, then optionally fetch and append its data.
+
+    symbol : ticker to add (e.g. 'PLTR', 'ETHUSDT')
+    max    : fetch full daily history and append to data/ohlcv_daily.parquet
+    daily  : fetch today's 1-min bars and append to data/ohlcv_1min.parquet
+
+    Crypto (quoteType='CRYPTOCURRENCY') is supported for daily (via Binance)
+    but not for max (yfinance daily history only covers equities/ETFs).
+    """
+    info = yf.Ticker(symbol).info
+    quote_type = info.get('quoteType')
+    if not quote_type:
+        print(f"'{symbol}' not found on yfinance — aborting.")
+        return
+
+    is_crypto = quote_type == 'CRYPTOCURRENCY'
+    print(f"Found {symbol}: {quote_type} — {info.get('longName', info.get('shortName', 'N/A'))}")
+
+    if max:
+        if is_crypto:
+            print(f"  Skipping max history for {symbol}: crypto daily history not supported (use Binance pull manually).")
+        else:
+            get_max_data([symbol])
+
+    if daily:
+        if is_crypto:
+            download_daily_1min([], [symbol])
+        else:
+            download_daily_1min([symbol], [])
 
