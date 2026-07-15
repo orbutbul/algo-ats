@@ -1,68 +1,122 @@
+import os
 import yfinance as yf
 from yfinance import EquityQuery
 import pandas as pd
 import requests
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
+from dotenv import load_dotenv
 from vectorbtpro import *
 from tradingview_screener import Query, col
 import pandas_market_calendars as mcal
 import re
 from tqdm import tqdm
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed, Adjustment
 from utils import *
 
+load_dotenv()
+
 # --- Paths ---
-OHLCV_PATH = Path('data/ohlcv_1min.parquet')   # 1-minute OHLCV bars for all asset classes
+OHLCV_PATH = Path('data/ohlcv_1min.parquet')       # 1-minute OHLCV bars for all asset classes
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
-BATCH_SIZE = 100                                # tickers per yfinance download call
+BATCH_SIZE = 100                                    # tickers per data-provider call
+LAST_RUN_PATH = Path('data/ohlcv_last_run.txt')     # timestamp of the last successful 1-min OHLCV pull
+
+_alpaca_client = StockHistoricalDataClient(os.environ['ALPACA_API_KEY'], os.environ['ALPACA_SECRET_KEY'])
+
+
+def _read_last_run() -> datetime | None:
+    if not LAST_RUN_PATH.exists():
+        return None
+    return datetime.fromisoformat(LAST_RUN_PATH.read_text().strip())
+
+
+def _write_last_run(ts: datetime) -> None:
+    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_RUN_PATH.write_text(ts.isoformat())
 
 
 
+_INVALID_SYMBOL_RE = re.compile(r'invalid symbol: ([^"]+)')
 
 
-def download_daily_1min(yf_symbols, crypto_symbols):
+def _fetch_alpaca_bars(symbols: list[str], start: datetime, end: datetime):
     """
-    Downloads today's 1-minute OHLCV bars and appends them to OHLCV_PATH.
-    Equities and ETFs are fetched via yfinance; cryptos via Binance (vectorbtpro).
+    Fetches 1-min bars for a batch of symbols. One malformed ticker (e.g. a
+    share-class symbol Alpaca doesn't recognize) fails the whole batch request,
+    so on that error this drops the offending symbol and retries rather than
+    losing every other symbol in the batch.
+    """
+    symbols = list(symbols)
+    while symbols:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+            adjustment=Adjustment.SPLIT,
+        )
+        try:
+            return _alpaca_client.get_stock_bars(req).df
+        except Exception as e:
+            bad = _INVALID_SYMBOL_RE.search(str(e))
+            if bad and bad.group(1) in symbols:
+                symbols.remove(bad.group(1))
+                continue
+            print(f'  Alpaca batch failed: {e}')
+            return None
+    return None
+
+
+def download_daily_1min(equity_symbols, crypto_symbols):
+    """
+    Downloads 1-minute OHLCV bars and appends them to OHLCV_PATH.
+    Equities and ETFs are fetched via Alpaca; cryptos via Binance (vectorbtpro).
     Deduplicates on (datetime, ticker) so re-running the same day is safe.
+
+    If the last successful pull was more than 24h ago (e.g. the machine was off),
+    backfills from that timestamp to now instead of just the latest session, so a
+    missed day doesn't leave a gap. Otherwise pulls the last 24h as usual.
     """
     OHLCV_PATH.parent.mkdir(parents=True, exist_ok=True)
     frames = []
 
-    # yfinance: download in batches to avoid rate limits
-    for i in range(0, len(yf_symbols), BATCH_SIZE):
-        batch = yf_symbols[i:i + BATCH_SIZE]
-        raw = yf.download(
-            tickers=batch,
-            period='1d',
-            interval='1m',
-            group_by='ticker',
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        if raw.empty:
+    now = datetime.now(timezone.utc)
+    last_run = _read_last_run()
+    if last_run is not None and (now - last_run) > timedelta(hours=24):
+        start = last_run
+        print(f'  Last run was {now - start} ago — backfilling from {start} to now.')
+    else:
+        start = now - timedelta(days=1)
+
+    # Alpaca: download in batches to keep request URLs a reasonable size
+    for i in range(0, len(equity_symbols), BATCH_SIZE):
+        batch = equity_symbols[i:i + BATCH_SIZE]
+        raw = _fetch_alpaca_bars(batch, start, now)
+        if raw is None or raw.empty:
             continue
-        # stack() pivots the ticker column level into the row index
-        batch_df = raw.stack(level=0, future_stack=True).rename_axis(['datetime', 'ticker'])
-        batch_df.columns = batch_df.columns.str.lower()
-        frames.append(batch_df)
+        batch_df = raw.rename_axis(['ticker', 'datetime']).swaplevel().sort_index()
+        frames.append(batch_df[OHLCV_COLS])
 
     # Binance US crypto data via vectorbtpro
     if crypto_symbols:
         vbt.BinanceData.set_custom_settings(client_config=dict(tld="us"))
         crypto_data = vbt.BinanceData.pull(
             crypto_symbols,
-            start='1 day ago',
+            start=start,
             timeframe='1m',
         )
         # vbt returns {ticker: df}; concat gives (ticker, datetime) — swap to match equities index order
         crypto_df = pd.concat(crypto_data.data).rename_axis(['ticker', 'datetime'])
         crypto_df = crypto_df.swaplevel().sort_index()
         crypto_df.columns = crypto_df.columns.str.lower()
-        crypto_df = crypto_df[['open', 'high', 'low', 'close', 'volume']]
+        crypto_df = crypto_df[OHLCV_COLS]
         frames.append(crypto_df)
 
     if not frames:
@@ -79,7 +133,7 @@ def download_daily_1min(yf_symbols, crypto_symbols):
 
     combined.sort_index(inplace=True)
     combined.to_parquet(OHLCV_PATH)
-    combined.to_csv('mama.csv')
+    _write_last_run(now)
     print(f'Saved {len(combined):,} rows to {OHLCV_PATH}')
 
 

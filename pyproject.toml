@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "alpaca-py>=0.43.5",
     "datetime>=6.0",
     "nbformat>=4.2.0",
     "pandas>=2.3.3",
@@ -12,6 +13,7 @@ dependencies = [
     "playwright>=1.59.0",
     "praw>=7.8.1",
     "prawcore>=2.4.0",
+    "python-dotenv>=1.2.2",
     "pytrends>=4.9.2",
     "tradingview-screener>=3.2.0",
     "vadersentiment>=3.3.2",

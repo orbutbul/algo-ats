@@ -50,8 +50,10 @@ def _tracked_symbols() -> dict:
 
     tickers = pd.read_parquet(OHLCV_PATH, columns=[]).index.get_level_values('ticker').unique().tolist()
 
-    # Crypto tickers on BinanceUS end with USDT/BUSD/BTC/ETH/BNB
-    crypto_pattern = re.compile(r'(USDT|BUSD|BTC|ETH|BNB)$')
+    # Crypto tickers on BinanceUS end with USDT/BUSD/BTC/ETH/BNB and are at least
+    # 6 chars (2+ char base asset + 3-4 char quote asset) — this excludes short
+    # equity tickers that happen to end in the same letters (e.g. 'ABNB').
+    crypto_pattern = re.compile(r'^.{2,}(USDT|BUSD|BTC|ETH|BNB)$')
     cryptos = [t for t in tickers if crypto_pattern.search(t)]
     non_cryptos = [t for t in tickers if not crypto_pattern.search(t)]
 

@@ -11,6 +11,13 @@ wheels/
 
 # actual data
 data/
+.env
+
+# daily_run.py logs
+logs/
 
 # Workshop files
 temp.ipynb
+
+# Reddit session cache
+.reddit_cookies.json
