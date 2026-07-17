@@ -21,3 +21,6 @@ temp.ipynb
 
 # Reddit session cache
 .reddit_cookies.json
+
+# Research notebooks (exploratory, not part of the pipeline)
+research/
