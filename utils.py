@@ -8,9 +8,11 @@ import time
 from pathlib import Path
 from vectorbtpro import *
 from tradingview_screener import Query, col
+from binance.client import Client as BinanceClient
 import pandas_market_calendars as mcal
 import re
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 # --- Paths ---
 OHLCV_PATH = Path('data/ohlcv_1min.parquet')   # 1-minute OHLCV bars for all asset classes
@@ -83,6 +85,14 @@ def screen_symbols():
         }
     )
     cryptos = [row['d'][0] for row in resp.json()['data']]
+    # Drop bare-USD-quoted pairs (e.g. 'DOGEUSD', quoteAsset='USD') — they get
+    # misclassified as equities by _tracked_symbols() since they don't end in
+    # USDT/BUSD/BTC/ETH/BNB, and Alpaca (equities/ETFs) can't fetch them.
+    # Checked against Binance.US's actual quoteAsset rather than a suffix
+    # guess, since e.g. 'SHIBUSD' (base 'SHIB', quote 'USD') coincidentally
+    # ends in the substring 'BUSD'.
+    quote_by_symbol = {s['symbol']: s['quoteAsset'] for s in BinanceClient(tld='us').get_exchange_info()['symbols']}
+    cryptos = [c for c in cryptos if quote_by_symbol.get(c) != 'USD']
 
     # Top 2000 US equities by market cap, requiring min 100k avg daily volume
     _, equities_df = (Query()
@@ -134,42 +144,34 @@ def _compute_allocations_single(
     top_k: int | None,
     long_only: bool,
 ) -> pd.DataFrame:
-    signals = signals.copy().fillna(0.0)
+    s = signals.fillna(0.0)
 
-    def _allocate_row(row: pd.Series) -> pd.Series:
-        signs = np.sign(row)
+    if long_only:
+        eligible = s.where(s > 0)
+    else:
+        eligible = s.abs().where(s != 0)
 
-        if long_only:
-            eligible = row[row > 0]
-        else:
-            eligible = row[row != 0].abs()
+    if top_k is not None:
+        eligible = eligible.where(
+            eligible.rank(axis=1, ascending=False, method='first') <= top_k
+        )
 
-        if eligible.empty:
-            return pd.Series(0.0, index=row.index)
+    if method == 'equal':
+        weights = eligible.notna().astype(float)
+    elif method == 'signal':
+        weights = eligible.fillna(0.0)
+    elif method == 'rank':
+        weights = eligible.rank(axis=1, method='first', na_option='keep').fillna(0.0)
+    elif method == 'inverse_rank':
+        weights = (1.0 / eligible.rank(axis=1, method='first', ascending=False, na_option='keep')).fillna(0.0)
 
-        if top_k is not None and top_k < len(eligible):
-            eligible = eligible.nlargest(top_k)
+    row_sums = weights.sum(axis=1)
+    weights = weights.div(row_sums.replace(0, np.nan), axis=0).fillna(0.0)
 
-        if method == "equal":
-            weights = pd.Series(1.0, index=eligible.index)
-        elif method == "signal":
-            weights = eligible
-        elif method == "rank":
-            weights = eligible.rank(method="first")
-        elif method == "inverse_rank":
-            weights = 1.0 / eligible.rank(method="first", ascending=False)
+    if not long_only:
+        weights *= np.sign(s)
 
-        weights = weights / weights.sum()
-
-        result = pd.Series(0.0, index=row.index)
-        if long_only:
-            result[weights.index] = weights
-        else:
-            result[weights.index] = weights * signs[weights.index]
-
-        return result
-
-    return signals.apply(_allocate_row, axis=1)
+    return weights
 
 
 def compute_allocations(
@@ -225,11 +227,17 @@ def compute_allocations(
     if not multi_method and not multi_top_k:
         return _compute_allocations_single(signals, methods[0], top_ks[0], long_only)
 
-    frames = {}
-    for m in methods:
-        for k in top_ks:
-            key = (m, k) if (multi_method and multi_top_k) else (m if multi_method else k)
-            frames[key] = _compute_allocations_single(signals, m, k, long_only)
+    combos = [
+        ((m, k) if (multi_method and multi_top_k) else (m if multi_method else k), m, k)
+        for m in methods for k in top_ks
+    ]
+
+    def _run(args):
+        key, m, k = args
+        return key, _compute_allocations_single(signals, m, k, long_only)
+
+    with ThreadPoolExecutor(max_workers=len(combos)) as ex:
+        frames = dict(ex.map(_run, combos))
 
     result = pd.concat(frames, axis=1)
 
