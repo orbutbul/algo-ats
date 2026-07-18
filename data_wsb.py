@@ -1,306 +1,577 @@
 """
-WSB scraper — pulls data from u/wsbapp's custom Reddit posts.
+WSB scraper — pulls data from u/verified-trader's custom Reddit posts.
 
-wsbapp uses Reddit's Devvit App Platform, so post content is served as a
-gRPC-Web protobuf from devvit-gateway.reddit.com.  We use Playwright to
-render the page, intercept that response, decode it, and extract:
-
-  - trending_tickers_daily / _hourly   list[str]
-  - karma_trending_daily               list[{username, karma}]
-  - commenter_trending_daily           list[{member, score}]
-  - session_store                      list[{ticker, name, price, change, ...}]
-  - daily_comment_metrics              list[float]  (hourly comment counts × 24)
-  - hourly_comment_metrics             list[float]
+verified-trader uses Reddit's Devvit App Platform, embedding a widget as an
+iframe. The widget renders clean, readable panels (MENTIONS 24H, SENTIMENT,
+LEADERBOARD, TOP HOLDINGS, TOP TRADES, plus a top ticker strip sorted by
+absolute % move which we treat as "biggest movers"). No Reddit login is
+required to view it. We render the post with Playwright, read the widget's
+plain visible text, and parse it by section header.
 
 Usage:
-    from data_wsb import fetch_wsbapp_post, get_latest_wsbapp_data
-    data = get_latest_wsbapp_data()          # returns dict
-    df   = get_latest_wsbapp_data(as_df=True)  # returns DataFrame of session_store
+    from data_wsb import fetch_wsb_post, get_latest_wsb_data
+    data = get_latest_wsb_data()
+    df   = get_latest_wsb_data(as_df=True)  # DataFrame of biggest_movers
+
+Debug (inspect raw widget text when the app changes):
+    from data_wsb import dump_widget_text
+    dump_widget_text()
 """
 
 from __future__ import annotations
 
-import struct
+import base64
+import os
+import re
 import requests
 import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Page, Frame
 
+
+REDDIT_USER = "verified-trader"
 
 # ---------------------------------------------------------------------------
-# Protobuf / gRPC helpers
+# Reddit OAuth helpers
 # ---------------------------------------------------------------------------
 
-def _b(v) -> str:
-    if isinstance(v, bytes):
-        return v.decode("utf-8", errors="replace")
-    s = str(v)
-    return s.strip("b'").strip("'")
-
-
-def _f64(int_val) -> float | None:
-    try:
-        return struct.unpack("d", struct.pack("Q", int(int_val)))[0]
-    except Exception:
+def _reddit_oauth_token() -> str | None:
+    """
+    Return a Reddit application-only access token using client credentials
+    from env vars REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET.
+    Returns None if credentials are not set.
+    """
+    client_id     = os.environ.get("REDDIT_CLIENT_ID", "")
+    client_secret = os.environ.get("REDDIT_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
         return None
 
+    creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    r = requests.post(
+        "https://www.reddit.com/api/v1/access_token",
+        headers={
+            "Authorization": f"Basic {creds}",
+            "User-Agent": "wsb_scraper/2.0",
+        },
+        data={"grant_type": "client_credentials"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
 
-def _parse_struct_list(lst: list | dict) -> dict:
-    """Convert a protobuf struct field-list into a plain {name: raw_val} dict."""
-    result = {}
-    for item in (lst if isinstance(lst, list) else [lst]):
-        if not isinstance(item, dict):
+# ---------------------------------------------------------------------------
+# Playwright: locate and read the Devvit widget
+# ---------------------------------------------------------------------------
+
+_IFRAME_SELECTORS = [
+    "iframe[src*='devvit']",
+    "iframe[src*='reddit-static']",
+    "iframe[id*='devvit']",
+    "shreddit-post iframe",
+    "div[data-testid='post-content'] iframe",
+]
+
+
+def _find_devvit_frame(page: Page) -> Frame | None:
+    for selector in _IFRAME_SELECTORS:
+        try:
+            el = page.query_selector(selector)
+            if el:
+                frame = el.content_frame()
+                if frame:
+                    return frame
+        except Exception:
             continue
-        key = _b(item.get("1", ""))
-        result[key] = item.get("2", {})
-    return result
+    return None
 
 
-def _unwrap(val) -> object:
-    """Recursively unwrap a single protobuf value into a Python scalar / list / dict."""
-    if not isinstance(val, dict):
-        return val
-    if "3" in val:
-        return _b(val["3"])
-    if "2" in val:
-        return _f64(val["2"])
-    if "1" in val:
-        return val["1"]
-    if "4" in val:
-        return bool(val["4"])
-    if "5" in val:
-        inner = val["5"].get("1", [])
-        if isinstance(inner, list):
-            return {k: _unwrap(v) for k, v in _parse_struct_list(inner).items()}
-        return inner
-    if "6" in val:
-        inner = val["6"].get("1", [])
-        if isinstance(inner, list):
-            return [_unwrap(x) for x in inner]
-    return val
+def _capture_widget_text(post_url: str) -> str:
+    """
+    Render a verified-trader post and return the Devvit widget's plain
+    visible text (default tab state only). No login required.
+    """
+    return _capture_widget_views(post_url)["base"]
 
 
-# ---------------------------------------------------------------------------
-# gRPC-Web frame decoder
-# ---------------------------------------------------------------------------
+def _click_visible_text(frame: Frame, label: str) -> bool:
+    """
+    Click a widget tab/button by its exact visible text. The widget renders a
+    hidden mobile-layout duplicate of every panel alongside the desktop one,
+    so get_by_text often matches 2+ elements — only one has a real bounding
+    box. Regular Locator.click() also fails its own visibility check against
+    the visible match (element is tiny, 7px font), so we dispatch a raw JS
+    click instead of relying on Playwright's actionability checks.
+    """
+    loc = frame.get_by_text(label, exact=True)
+    for i in range(loc.count()):
+        box = loc.nth(i).bounding_box()
+        if box and box["width"] > 0 and box["height"] > 0:
+            loc.nth(i).evaluate("el => el.click()")
+            return True
+    return False
 
-def _strip_grpc_frame(body: bytes) -> bytes:
-    """Remove the 5-byte gRPC-Web frame header."""
-    msg_len = struct.unpack(">I", body[1:5])[0]
-    return body[5 : 5 + msg_len]
+
+def _click_sentiment_toggle(frame: Frame) -> bool:
+    """Click the 'NN% Bear'/'NN% Bull' button to flip the sentiment panel."""
+    for b in frame.query_selector_all("button"):
+        t = (b.inner_text() or "").strip()
+        if t.endswith("Bear") or t.endswith("Bull"):
+            box = b.bounding_box()
+            if box and box["width"] > 0:
+                b.evaluate("el => el.click()")
+                return True
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Playwright: render post and capture devvit-gateway response
-# ---------------------------------------------------------------------------
-
-def _capture_devvit_proto(post_url: str) -> bytes:
-    """Launch a headless browser, load the post, return the raw protobuf bytes."""
-    proto: dict[str, bytes] = {}
-
-    def on_response(response):
-        if "RenderPostContent" in response.url:
-            proto["body"] = response.body()
-
+def _capture_widget_views(post_url: str) -> dict[str, str]:
+    """
+    Render a verified-trader post and capture the Devvit widget's plain
+    visible text under three tab states — no login required:
+      - "base":            default state (Comments leaderboard, one sentiment direction)
+      - "leaderboard_alt":  Leaderboard switched to its Streaks tab
+      - "sentiment_alt":    Sentiment switched to its inverse (Bull<->Bear) direction
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/120.0"
-            )
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
         )
-        page.on("response", on_response)
-        page.goto(post_url, wait_until="networkidle", timeout=45_000)
-        browser.close()
+        try:
+            # "load" not "networkidle" — Reddit keeps polling and never idles.
+            page.goto(post_url, wait_until="load", timeout=60_000)
+            page.wait_for_timeout(5_000)
 
-    if "body" not in proto:
-        raise RuntimeError(f"No devvit-gateway response captured for {post_url}")
-    return _strip_grpc_frame(proto["body"])
+            frame = _find_devvit_frame(page)
+            if frame is None:
+                raise RuntimeError(f"Devvit widget iframe not found on {post_url}")
+
+            try:
+                frame.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3_000)
+
+            views = {"base": frame.inner_text("body")}
+
+            if _click_visible_text(frame, "Streaks"):
+                page.wait_for_timeout(1_500)
+                views["leaderboard_alt"] = frame.inner_text("body")
+                _click_visible_text(frame, "Comments")  # restore, for cleanliness
+                page.wait_for_timeout(500)
+            else:
+                views["leaderboard_alt"] = ""
+
+            if _click_sentiment_toggle(frame):
+                page.wait_for_timeout(1_500)
+                views["sentiment_alt"] = frame.inner_text("body")
+            else:
+                views["sentiment_alt"] = ""
+
+            return views
+        finally:
+            browser.close()
 
 
 # ---------------------------------------------------------------------------
-# Protobuf decode → structured data
+# Text parsing
 # ---------------------------------------------------------------------------
 
-def _decode_proto(proto_bytes: bytes) -> dict:
-    import blackboxprotobuf  # lazy import – only needed here
+_SECTION_HEADERS = ["MENTIONS 24H", "SENTIMENT", "LEADERBOARD", "TOP HOLDINGS", "TOP TRADES"]
+_SECTION_END = "CONNECT & VERIFY"
+_JUNK_LINES = {"TABLE", "CHART", "COMMENTS", "STREAKS", "·"}
 
-    msg, _ = blackboxprotobuf.decode_message(proto_bytes)
-    return msg
+_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 
-def _extract_wsb_data(msg: dict) -> dict:
-    """Walk the decoded protobuf and return a clean dict of WSB data."""
-    states = msg.get("1", {}).get("1", [])
+def _num(s: str) -> float | None:
+    """Parse '$1,365.50', '-7.95%', '+$44.4k', '×250' etc. into a float."""
+    if s is None:
+        return None
+    s = s.strip().lstrip("×").replace(",", "").replace("$", "").replace("%", "")
+    s = s.lstrip("+")
+    mult = 1.0
+    if s and s[-1] in ("k", "K"):
+        mult, s = 1_000.0, s[:-1]
+    elif s and s[-1] in ("m", "M"):
+        mult, s = 1_000_000.0, s[:-1]
+    try:
+        return float(s) * mult
+    except (TypeError, ValueError):
+        return None
 
-    # Find the useState-0 entry which holds appState + sessionStore
-    for s in states:
-        name = _b(s.get("1", ""))
-        if "MainApp.useState-0" not in name:
+
+def _split_sections(text: str) -> dict[str, list[str]]:
+    """
+    Split raw widget text into named line-blocks: ticker_strip (everything
+    before the first known header) plus one block per known section header,
+    each cut off at the next known header (or CONNECT & VERIFY at the end).
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    end_idx = next((i for i, ln in enumerate(lines) if ln == _SECTION_END), len(lines))
+
+    # Only search for headers before the end marker — labels like "SENTIMENT"
+    # and "MENTIONS" recur as column headers in the trailing per-ticker detail
+    # card past CONNECT & VERIFY, and would otherwise corrupt slice boundaries.
+    header_positions: list[tuple[str, int]] = []
+    for i, ln in enumerate(lines[:end_idx]):
+        if ln in _SECTION_HEADERS:
+            header_positions.append((ln, i))
+
+    sections: dict[str, list[str]] = {}
+    first_header_idx = header_positions[0][1] if header_positions else len(lines)
+
+    # Ticker strip: everything before the first header, starting from the
+    # first line that actually looks like a ticker symbol (skips nav chrome
+    # like "Closed" / "Opens 9h 54m" / "Daily Thread" / "Me" / "Data" / "Casino").
+    strip_start = next(
+        (i for i in range(first_header_idx) if _TICKER_RE.match(lines[i])),
+        first_header_idx,
+    )
+    sections["ticker_strip"] = lines[strip_start:first_header_idx]
+
+    for idx, (name, pos) in enumerate(header_positions):
+        stop = header_positions[idx + 1][1] if idx + 1 < len(header_positions) else end_idx
+        block = [ln for ln in lines[pos + 1: stop] if ln not in _JUNK_LINES]
+        sections[name] = block
+
+    return sections
+
+
+def _parse_ticker_groups(lines: list[str], cols: int) -> list[dict]:
+    """Consume `cols` lines at a time: ticker, price, change_pct[, count]."""
+    out = []
+    for i in range(0, len(lines) - cols + 1, cols):
+        group = lines[i:i + cols]
+        row = {
+            "ticker": group[0],
+            "price": _num(group[1]),
+            "change_pct": _num(group[2]),
+        }
+        if cols == 4:
+            row["count"] = _num(group[3])
+        out.append(row)
+    return out
+
+
+def _parse_biggest_movers(lines: list[str]) -> list[dict]:
+    rows = _parse_ticker_groups(lines, cols=3)
+    seen = set()
+    deduped = []
+    for r in rows:
+        if r["ticker"] in seen:
             continue
+        seen.add(r["ticker"])
+        deduped.append(r)
+    return deduped
 
-        fields = _parse_struct_list(s["2"]["5"]["1"])
-        value_raw = fields.get("value", {})
-        app = _parse_struct_list(value_raw.get("5", {}).get("1", []))
-        inner_app = _parse_struct_list(
-            app.get("appState", {}).get("5", {}).get("1", [])
-        )
 
-        result = {}
+def _parse_sentiment_state(lines: list[str]) -> dict:
+    """
+    Parse one Sentiment tab state (either the default direction or the
+    inverse, after clicking the 'NN% Bear'/'NN% Bull' toggle). Each ticker
+    row shows a bull:bear split (e.g. "24:2") and the dominant side's %.
+    """
+    if not lines:
+        return {"overall_pct": None, "overall_label": None, "tickers": []}
 
-        # --- Trending tickers ---
-        for key in ("trendingTickersDaily", "trendingTickersHourly"):
-            raw = inner_app.get(key, {})
-            tickers = []
-            for item in raw.get("6", {}).get("1", []):
-                t = _b(item.get("3", b""))
-                if t:
-                    tickers.append(t)
-            result[key] = tickers
+    m = re.match(r"(\d+)%\s*(\w+)", lines[0])
+    overall_pct = float(m.group(1)) if m else None
+    overall_label = m.group(2) if m else None
 
-        # --- Karma trending ---
-        for key in ("karmaTrendingDaily", "karmaTrendingHourly"):
-            raw = inner_app.get(key, {})
-            users = []
-            for item in raw.get("6", {}).get("1", []):
-                fields_ = _parse_struct_list(item.get("5", {}).get("1", []))
-                users.append({
-                    "username": _b(fields_.get("username", {}).get("3", b"")),
-                    "karma":    _f64(fields_.get("karma", {}).get("2", 0)),
-                })
-            result[key] = users
+    tickers = []
+    rest = lines[1:]
+    for i in range(0, len(rest) - 2, 3):
+        ticker, split, pct = rest[i:i + 3]
+        tickers.append({"ticker": ticker, "split": split, "pct": _num(pct)})
 
-        # --- Commenter trending ---
-        for key in ("commenterTrendingDaily", "commenterTrendingHourly"):
-            raw = inner_app.get(key, {})
-            users = []
-            for item in raw.get("6", {}).get("1", []):
-                fields_ = _parse_struct_list(item.get("5", {}).get("1", []))
-                users.append({
-                    "member": _b(fields_.get("member", {}).get("3", b"")),
-                    "score":  _f64(fields_.get("score", {}).get("2", 0)),
-                })
-            result[key] = users
+    return {"overall_pct": overall_pct, "overall_label": overall_label, "tickers": tickers}
 
-        # --- Comment / submission metrics (time-series arrays) ---
-        for key in ("dailyCommentMetrics", "hourlyCommentMetrics",
-                    "dailySubmissionMetrics", "hourlySubmissionMetrics"):
-            raw = inner_app.get(key, {})
-            vals = [_f64(x.get("2", 0)) for x in raw.get("6", {}).get("1", [])]
-            result[key] = vals
 
-        # --- Session store (stock prices) ---
-        ss_raw = app.get("sessionStore", {})
-        stocks = []
-        for entry in ss_raw.get("6", {}).get("1", []):
-            stock = _parse_struct_list(entry.get("5", {}).get("1", []))
-            sess = _parse_struct_list(
-                stock.get("session", {}).get("5", {}).get("1", [])
-            )
-            stocks.append({
-                "ticker":        _b(stock.get("ticker", {}).get("3", b"")),
-                "name":          _b(stock.get("name",   {}).get("3", b"")),
-                "type":          _b(stock.get("type",   {}).get("3", b"")),
-                "market_status": _b(stock.get("market_status", {}).get("3", b"")),
-                "price":         _f64(stock.get("price", {}).get("2", 0)),
-                "change":        _f64(sess.get("change", {}).get("2", 0)),
-                "change_pct":    _f64(sess.get("change_percent", {}).get("2", 0)),
-                "volume":        _f64(sess.get("volume", {}).get("2", 0)),
-                "prev_close":    _f64(sess.get("previous_close", {}).get("2", 0)),
-                "early_chg":     _f64(sess.get("early_trading_change", {}).get("2", 0)),
-                "early_chg_pct": _f64(sess.get("early_trading_change_percent", {}).get("2", 0)),
-                "late_chg":      _f64(sess.get("late_trading_change", {}).get("2", 0)),
-                "late_chg_pct":  _f64(sess.get("late_trading_change_percent", {}).get("2", 0)),
-            })
-        result["sessionStore"] = stocks
+def _combine_sentiment(base_lines: list[str], alt_lines: list[str]) -> dict:
+    """
+    Combine the default and toggled Sentiment tab states into one dict keyed
+    by direction (bearish/bullish), regardless of which one was the default.
+    """
+    states = [_parse_sentiment_state(base_lines)]
+    if alt_lines:
+        states.append(_parse_sentiment_state(alt_lines))
 
-        # --- Polymarket data ---
-        poly_raw = app.get("polymarketData", {})
-        markets = []
-        for item in poly_raw.get("6", {}).get("1", []):
-            fields_ = _parse_struct_list(item.get("5", {}).get("1", []))
-            markets.append({
-                "title": _b(fields_.get("title", {}).get("3", b"")),
-                "url":   _b(fields_.get("url",   {}).get("3", b"")),
-            })
-        result["polymarketData"] = markets
+    by_label = {s["overall_label"]: s for s in states if s["overall_label"]}
+    bear = by_label.get("Bear", {"overall_pct": None, "tickers": []})
+    bull = by_label.get("Bull", {"overall_pct": None, "tickers": []})
 
-        return result
+    return {
+        "bearish_pct": bear.get("overall_pct"),
+        "bullish_pct": bull.get("overall_pct"),
+        "most_bearish": bear.get("tickers", []),
+        "most_bullish": bull.get("tickers", []),
+    }
 
-    raise RuntimeError("Could not locate MainApp.useState-0 in protobuf state")
+
+def _parse_leaderboard(lines: list[str]) -> list[dict]:
+    out = []
+    for i in range(0, len(lines) - 1, 2):
+        username, count = lines[i:i + 2]
+        out.append({"username": username, "count": _num(count)})
+    return out
+
+
+def _parse_leaderboard_streaks(lines: list[str]) -> list[dict]:
+    """Parse the Leaderboard panel's Streaks tab: username, 'Nd' streak length."""
+    out = []
+    for i in range(0, len(lines) - 1, 2):
+        username, streak = lines[i:i + 2]
+        out.append({"username": username, "streak_days": _num(streak.rstrip("dD"))})
+    return out
+
+
+def _parse_top_trades(lines: list[str]) -> list[dict]:
+    out = []
+    i = 0
+    while i < len(lines):
+        ticker = lines[i]
+        i += 1
+        if i >= len(lines):
+            break
+        contract = None
+        if not lines[i].startswith("×"):
+            contract = lines[i]
+            i += 1
+        if i >= len(lines):
+            break
+        qty = _num(lines[i])
+        i += 1
+        if i >= len(lines):
+            break
+        pnl = _num(lines[i])
+        i += 1
+        out.append({"ticker": ticker, "contract": contract, "qty": qty, "pnl": pnl})
+    return out
+
+
+def _extract_wsb_data(views: dict[str, str]) -> dict:
+    """
+    views: {"base": str, "leaderboard_alt": str, "sentiment_alt": str} as
+    produced by _capture_widget_views (a bare str is also accepted for
+    backward-compat / ad-hoc use, treated as the base-only view).
+    """
+    if isinstance(views, str):
+        views = {"base": views, "leaderboard_alt": "", "sentiment_alt": ""}
+
+    sections = _split_sections(views["base"])
+    alt_leaderboard_sections = _split_sections(views.get("leaderboard_alt", "") or "")
+    alt_sentiment_sections = _split_sections(views.get("sentiment_alt", "") or "")
+
+    return {
+        "biggest_movers": _parse_biggest_movers(sections.get("ticker_strip", [])),
+        "mentions":       _parse_ticker_groups(sections.get("MENTIONS 24H", []), cols=4),
+        "sentiment":      _combine_sentiment(
+                              sections.get("SENTIMENT", []),
+                              alt_sentiment_sections.get("SENTIMENT", []),
+                          ),
+        "leaderboard": {
+            "by_comments": _parse_leaderboard(sections.get("LEADERBOARD", [])),
+            "by_streak":   _parse_leaderboard_streaks(alt_leaderboard_sections.get("LEADERBOARD", [])),
+        },
+        "top_holdings":   _parse_ticker_groups(sections.get("TOP HOLDINGS", []), cols=4),
+        "top_trades":     _parse_top_trades(sections.get("TOP TRADES", [])),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def list_wsbapp_posts(limit: int = 25) -> list[dict]:
-    """Return recent posts by u/wsbapp as a list of dicts (id, title, url, created_utc)."""
-    url = "https://www.reddit.com/user/wsbapp/submitted.json"
-    r = requests.get(url, headers={"User-Agent": "wsb_scraper/1.0"}, params={"limit": limit})
+def list_wsb_posts(limit: int = 25) -> list[dict]:
+    """
+    Return recent posts by u/verified-trader as a list of dicts.
+    Uses OAuth if REDDIT_CLIENT_ID/SECRET are set, otherwise falls back
+    to Playwright (browser-rendered profile page).
+    """
+    token = _reddit_oauth_token()
+    if token:
+        return _list_posts_oauth(token, limit)
+    return _list_posts_playwright(limit)
+
+
+def _list_posts_oauth(token: str, limit: int) -> list[dict]:
+    url = f"https://oauth.reddit.com/user/{REDDIT_USER}/submitted"
+    r = requests.get(
+        url,
+        headers={"Authorization": f"bearer {token}", "User-Agent": "wsb_scraper/2.0"},
+        params={"limit": limit, "sort": "new"},
+        timeout=15,
+    )
     r.raise_for_status()
+    return _parse_listing_json(r.json())
+
+
+def _list_posts_playwright(limit: int) -> list[dict]:
+    """
+    Find 'What Are Your Moves' posts on r/wallstreetbets via old.reddit.com.
+    old Reddit is server-rendered HTML so selectors are stable.
+    Returns www.reddit.com URLs so the widget can be rendered directly.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            )
+        )
+        page.goto("https://old.reddit.com/r/wallstreetbets/", wait_until="domcontentloaded", timeout=45_000)
+
+        collected = []
+        for thing in page.query_selector_all("div.thing[data-fullname]"):
+            title_el = thing.query_selector("a.title")
+            if not title_el:
+                continue
+            title = title_el.inner_text().strip()
+            if "what are your moves" not in title.lower():
+                continue
+
+            href    = title_el.get_attribute("href") or ""
+            ts      = thing.get_attribute("data-timestamp")
+            post_id = (thing.get_attribute("data-fullname") or "")[3:]
+
+            full_url = href.replace("old.reddit.com", "www.reddit.com")
+            if full_url.startswith("/"):
+                full_url = f"https://www.reddit.com{full_url}"
+
+            created = (datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+                       if ts else datetime.now(tz=timezone.utc))
+            collected.append({"id": post_id, "title": title, "url": full_url, "created_utc": created})
+            if len(collected) >= limit:
+                break
+
+        browser.close()
+
+    return collected
+
+
+def _parse_listing_json(data: dict) -> list[dict]:
     posts = []
-    for p in r.json()["data"]["children"]:
-        d = p["data"]
+    for p in data.get("data", {}).get("children", []):
+        d = p.get("data", {})
         posts.append({
-            "id":          d["id"],
-            "title":       d["title"],
-            "url":         f"https://www.reddit.com{d['permalink']}",
-            "created_utc": datetime.fromtimestamp(d["created_utc"], tz=timezone.utc),
+            "id":          d.get("id", ""),
+            "title":       d.get("title", ""),
+            "url":         f"https://www.reddit.com{d['permalink']}" if d.get("permalink") else "",
+            "created_utc": datetime.fromtimestamp(d["created_utc"], tz=timezone.utc) if d.get("created_utc") else datetime.now(tz=timezone.utc),
         })
     return posts
 
 
-def fetch_wsbapp_post(post_url: str) -> dict:
+def fetch_wsb_post(post_url: str) -> dict:
     """
-    Render a wsbapp post URL and return a dict with all extracted data.
-
-    Keys: trendingTickersDaily, trendingTickersHourly, karmaTrendingDaily,
-          karmaTrendingHourly, commenterTrendingDaily, commenterTrendingHourly,
-          dailyCommentMetrics, hourlyCommentMetrics, dailySubmissionMetrics,
-          hourlySubmissionMetrics, sessionStore, polymarketData
+    Render a verified-trader post URL and return a dict with all extracted data.
+    Keys: biggest_movers, mentions, sentiment, leaderboard, top_holdings, top_trades
     """
-    proto_bytes = _capture_devvit_proto(post_url)
-    msg = _decode_proto(proto_bytes)
-    return _extract_wsb_data(msg)
+    views = _capture_widget_views(post_url)
+    return _extract_wsb_data(views)
 
 
-def get_latest_wsbapp_data(
-    post_type: str = "moves",
+def get_latest_wsb_data(
+    post_type: str = "any",
     as_df: bool = False,
 ) -> dict | pd.DataFrame:
     """
-    Fetch data from the most recent wsbapp post matching post_type.
+    Fetch data from the most recent verified-trader post.
 
     post_type:
-        'moves'    → 'What Are Your Moves Tomorrow' (has full stock data)
-        'daily'    → 'Daily Discussion Thread'
-        'weekend'  → 'Weekend Discussion Thread'
+        'any'      → most recent post regardless of title (default)
+        'moves'    → title contains 'What Are Your Moves'
+        'daily'    → title contains 'Daily Discussion'
+        'weekend'  → title contains 'Weekend Discussion'
+        any string → used as a raw substring filter on the title
 
-    If as_df=True, returns a DataFrame of session_store stocks instead.
+    If as_df=True, returns a DataFrame of biggest_movers.
     """
     keywords = {
         "moves":   "What Are Your Moves",
         "daily":   "Daily Discussion",
         "weekend": "Weekend Discussion",
+        "any":     "",
     }
     kw = keywords.get(post_type, post_type)
 
-    posts = list_wsbapp_posts(limit=25)
-    matching = [p for p in posts if kw.lower() in p["title"].lower()]
-    if not matching:
-        raise ValueError(f"No recent wsbapp post matching '{kw}'")
+    posts = list_wsb_posts(limit=25)
 
-    data = fetch_wsbapp_post(matching[0]["url"])
-    data["post_title"]  = matching[0]["title"]
-    data["post_date"]   = matching[0]["created_utc"]
+    if not posts:
+        raise ValueError(f"No posts found for u/{REDDIT_USER} — check the username or credentials")
+
+    matching = [p for p in posts if not kw or kw.lower() in p["title"].lower()]
+    if not matching:
+        available = "\n  ".join(f"'{p['title']}'" for p in posts[:10])
+        raise ValueError(
+            f"No post from u/{REDDIT_USER} matching '{kw}'.\n"
+            f"Available titles:\n  {available}"
+        )
+
+    data = fetch_wsb_post(matching[0]["url"])
+    data["post_title"] = matching[0]["title"]
+    data["post_date"]  = matching[0]["created_utc"]
 
     if as_df:
-        return pd.DataFrame(data["sessionStore"])
+        return pd.DataFrame(data["biggest_movers"])
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# Debug helper — call this when the widget changes to inspect its raw text
+# ---------------------------------------------------------------------------
+
+def check_user(user: str = REDDIT_USER) -> None:
+    """
+    Quick diagnostic: print the first 10 post titles found for a Reddit user.
+    Use this to verify the username and that post discovery is working.
+
+    Example:
+        from data_wsb import check_user
+        check_user()                      # checks REDDIT_USER
+        check_user("some-other-account")  # checks a different account
+    """
+    old = globals()["REDDIT_USER"]
+    # Temporarily override so _list_posts_playwright uses the right name
+    import data_wsb as _self
+    _self.REDDIT_USER = user
+    try:
+        posts = list_wsb_posts(limit=10)
+    finally:
+        _self.REDDIT_USER = old
+
+    if not posts:
+        print(f"No posts found for u/{user}. The username may be wrong or the account has no public posts.")
+        return
+    print(f"Found {len(posts)} post(s) for u/{user}:")
+    for p in posts:
+        print(f"  [{p['created_utc'].strftime('%Y-%m-%d')}] {p['title']}")
+        print(f"           {p['url']}")
+
+
+def dump_widget_text(post_url: str | None = None, out_path: str = "widget_text_dump.txt") -> None:
+    """
+    Render a post and write the widget's raw visible text to out_path.
+    Use this to re-derive the section parsers if Reddit changes the widget
+    layout again — no protobuf tooling needed, just read the panel labels.
+    """
+    if post_url is None:
+        posts = list_wsb_posts(limit=5)
+        if not posts:
+            raise RuntimeError("No posts found")
+        post_url = posts[0]["url"]
+
+    text = _capture_widget_text(post_url)
+    Path(out_path).write_text(text, encoding="utf-8")
+    print(f"Widget text written to {out_path} ({len(text)} chars)")
 
 
 # ---------------------------------------------------------------------------
@@ -310,67 +581,97 @@ def get_latest_wsbapp_data(
 WSB_DIR = Path("data/wsb")
 
 _FILES = {
-    "trending_tickers":  WSB_DIR / "trending_tickers.parquet",
-    "karma_trending":    WSB_DIR / "karma_trending.parquet",
-    "commenter_trending": WSB_DIR / "commenter_trending.parquet",
-    "session_store":     WSB_DIR / "session_store.parquet",
+    "sentiment":           WSB_DIR / "sentiment.parquet",
+    "sentiment_most_bearish": WSB_DIR / "sentiment_most_bearish.parquet",
+    "sentiment_most_bullish": WSB_DIR / "sentiment_most_bullish.parquet",
+    "top_holdings":        WSB_DIR / "top_holdings.parquet",
+    "top_trades":          WSB_DIR / "top_trades.parquet",
+    "biggest_movers":      WSB_DIR / "biggest_movers.parquet",
+    "mentions":            WSB_DIR / "mentions.parquet",
+    "leaderboard":         WSB_DIR / "leaderboard.parquet",
+    "leaderboard_streaks": WSB_DIR / "leaderboard_streaks.parquet",
 }
 
 
 def save_wsb_data(data: dict) -> None:
     """
-    Append today's WSB snapshot to the four parquet files in data/wsb/.
-
-    Safe to call multiple times on the same day — existing rows for that
-    date are replaced, not duplicated.
+    Append today's WSB snapshot to the parquet files in data/wsb/.
+    Safe to call multiple times on the same day — existing rows are replaced.
     """
     WSB_DIR.mkdir(parents=True, exist_ok=True)
 
-    post_date = data["post_date"]
+    post_date = data.get("post_date")
     if isinstance(post_date, datetime):
         date = post_date.date()
-    else:
+    elif post_date is not None:
         date = pd.Timestamp(post_date).date()
+    else:
+        date = datetime.now(timezone.utc).date()
 
-    # --- trending_tickers ---
+    # --- sentiment (single row per day: both directions' overall score) ---
+    sent = data.get("sentiment", {})
+    sent_row = {
+        "date": date,
+        "bearish_pct": sent.get("bearish_pct"),
+        "bullish_pct": sent.get("bullish_pct"),
+    }
+    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date"])
+
+    for direction in ("most_bearish", "most_bullish"):
+        rows = [{"date": date, "rank": i + 1, **r}
+                for i, r in enumerate(sent.get(direction, []))]
+        if rows:
+            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "rank"])
+
+    # --- top_holdings ---
+    rows = [{"date": date, "rank": i + 1, **r}
+            for i, r in enumerate(data.get("top_holdings", []))]
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "rank"])
+
+    # --- top_trades ---
+    rows = [{"date": date, "rank": i + 1, **r}
+            for i, r in enumerate(data.get("top_trades", []))]
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "rank"])
+
+    # --- biggest_movers ---
+    rows = [{"date": date, "rank": i + 1, **r}
+            for i, r in enumerate(data.get("biggest_movers", []))]
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "rank"])
+
+    # --- mentions ---
     rows = []
-    for tf, key in (("daily", "trendingTickersDaily"), ("hourly", "trendingTickersHourly")):
-        for rank, ticker in enumerate(data.get(key, []), 1):
-            rows.append({"date": date, "timeframe": tf, "rank": rank, "ticker": ticker})
-    _append(pd.DataFrame(rows), _FILES["trending_tickers"], dedup_cols=["date", "timeframe", "ticker"])
+    for i, m in enumerate(data.get("mentions", [])):
+        ticker = m.get("ticker", "")
+        if ticker:
+            rows.append({"date": date, "rank": i + 1, "ticker": ticker,
+                         "price": m.get("price"), "change_pct": m.get("change_pct"),
+                         "count": m.get("count")})
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "ticker"])
 
-    # --- karma_trending ---
-    rows = []
-    for tf, key in (("daily", "karmaTrendingDaily"), ("hourly", "karmaTrendingHourly")):
-        for rank, u in enumerate(data.get(key, []), 1):
-            rows.append({"date": date, "timeframe": tf, "rank": rank,
-                         "username": u["username"], "karma": u["karma"]})
-    _append(pd.DataFrame(rows), _FILES["karma_trending"], dedup_cols=["date", "timeframe", "username"])
+    # --- leaderboard (by comments, and by streak length) ---
+    lb = data.get("leaderboard", {})
+    rows = [{"date": date, "rank": i + 1, **r}
+            for i, r in enumerate(lb.get("by_comments", []))]
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "rank"])
 
-    # --- commenter_trending ---
-    rows = []
-    for tf, key in (("daily", "commenterTrendingDaily"), ("hourly", "commenterTrendingHourly")):
-        for rank, u in enumerate(data.get(key, []), 1):
-            rows.append({"date": date, "timeframe": tf, "rank": rank,
-                         "member": u["member"], "score": u["score"]})
-    _append(pd.DataFrame(rows), _FILES["commenter_trending"], dedup_cols=["date", "timeframe", "member"])
+    rows = [{"date": date, "rank": i + 1, **r}
+            for i, r in enumerate(lb.get("by_streak", []))]
+    if rows:
+        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "rank"])
 
-    # --- session_store ---
-    keep = ["ticker", "name", "type", "market_status",
-            "price", "change", "change_pct", "volume", "prev_close"]
-    rows = [{**{k: s[k] for k in keep}, "date": date} for s in data.get("sessionStore", [])]
-    _append(pd.DataFrame(rows), _FILES["session_store"], dedup_cols=["date", "ticker"])
-
-    print(f"Saved WSB data for {date} → {WSB_DIR}/")
+    print(f"Saved WSB data for {date} -> {WSB_DIR}/")
 
 
 def _append(new_df: pd.DataFrame, path: Path, dedup_cols: list[str]) -> None:
-    """Read existing parquet (if any), drop rows matching today's dedup_cols, append new rows."""
     if new_df.empty:
         return
     if path.exists():
         existing = pd.read_parquet(path)
-        # Drop any rows already stored for the same date (idempotent re-runs)
         mask = existing[dedup_cols[0]].astype(str).isin(new_df[dedup_cols[0]].astype(str))
         for col in dedup_cols[1:]:
             mask &= existing[col].astype(str).isin(new_df[col].astype(str))
@@ -385,14 +686,17 @@ def load_wsb_data(table: str, date_from: str | None = None) -> pd.DataFrame:
     """
     Read a stored WSB table.
 
-    table: 'trending_tickers' | 'karma_trending' | 'commenter_trending' | 'session_store'
-    date_from: optional ISO date string, e.g. '2026-05-01' to filter from that date onward.
+    table: 'sentiment' | 'sentiment_most_bearish' | 'sentiment_most_bullish'
+         | 'top_holdings' | 'top_trades' | 'biggest_movers' | 'mentions'
+         | 'leaderboard' | 'leaderboard_streaks'
+    date_from: optional ISO date string, e.g. '2026-05-01'
     """
-    path = _FILES[table]
+    path = _FILES.get(table)
+    if path is None:
+        raise ValueError(f"Unknown table '{table}'. Choose from: {list(_FILES)}")
     if not path.exists():
         raise FileNotFoundError(f"{path} not found — run save_wsb_data() first")
     df = pd.read_parquet(path)
     if date_from:
         df = df[pd.to_datetime(df["date"]) >= pd.Timestamp(date_from)]
     return df
-

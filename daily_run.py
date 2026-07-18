@@ -1,9 +1,11 @@
 """
 daily_run.py — scheduled via Windows Task Scheduler at 5:00 PM ET.
 
-Runs two pipelines in order:
-  1. 1-minute OHLCV for today (equities, ETFs, crypto)
-  2. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale)
+Runs, independently of one another (a failure in one does not block the rest):
+  1. Symbol screening (equities/ETFs/cryptos — feeds sections 2 and 3)
+  2. 1-minute OHLCV for today (equities, ETFs, crypto)
+  3. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale)
+  4. WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
 """
 
 import logging
@@ -17,6 +19,7 @@ import pandas_market_calendars as mcal
 from utils import screen_symbols
 from data_ohlcv import download_daily_1min
 from data_fundamentals import fundamentals, FUNDAMENTALS_SPECS
+from data_wsb import get_latest_wsb_data, save_wsb_data
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,9 +53,11 @@ def run():
     errors = []
 
     # ------------------------------------------------------------------
-    # 1. Screen symbols (shared across all pipelines)
+    # 1. Screen symbols (shared across sections 2 and 3 — section 4 doesn't
+    #    depend on this, and still runs even if screening fails)
     # ------------------------------------------------------------------
     log.info('--- Screening symbols ---')
+    screen = None
     try:
         screen = screen_symbols()
         log.info(
@@ -60,15 +65,17 @@ def run():
             len(screen['equities']), len(screen['etfs']), len(screen['cryptos']),
         )
     except Exception:
-        log.error('FAILED to screen symbols — aborting run.')
+        errors.append('symbol screening')
         log.error(traceback.format_exc())
-        sys.exit(1)
 
     # ------------------------------------------------------------------
     # 2. 1-minute OHLCV (only on market days)
     # ------------------------------------------------------------------
     log.info('--- 1-min OHLCV ---')
-    if is_market_day():
+    if screen is None:
+        errors.append('1-min OHLCV (skipped — symbol screening failed)')
+        log.warning('Skipping — symbol screening failed.')
+    elif is_market_day():
         try:
             download_daily_1min(screen['equities'] + screen['etfs'], screen['cryptos'])
         except Exception:
@@ -81,10 +88,25 @@ def run():
     # 3. Fundamentals (staleness-aware, only runs what needs updating)
     # ------------------------------------------------------------------
     log.info('--- Fundamentals ---')
+    if screen is None:
+        errors.append('fundamentals (skipped — symbol screening failed)')
+        log.warning('Skipping — symbol screening failed.')
+    else:
+        try:
+            fundamentals(screen, specs=FUNDAMENTALS_SPECS)
+        except Exception:
+            errors.append('fundamentals')
+            log.error(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # 4. WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
+    # ------------------------------------------------------------------
+    log.info('--- WSB data ---')
     try:
-        fundamentals(screen, specs=FUNDAMENTALS_SPECS)
+        wsb_data = get_latest_wsb_data(post_type='moves')
+        save_wsb_data(wsb_data)
     except Exception:
-        errors.append('fundamentals')
+        errors.append('WSB data')
         log.error(traceback.format_exc())
 
     # ------------------------------------------------------------------
