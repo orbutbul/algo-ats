@@ -43,6 +43,16 @@ def _write_last_run(ts: datetime) -> None:
 
 
 _INVALID_SYMBOL_RE = re.compile(r'invalid symbol: ([^"]+)')
+_SHARE_CLASS_RE = re.compile(r'^([A-Z0-9]+)-([A-Z]{1,2})$')
+
+
+def _to_alpaca_symbol(symbol: str) -> str:
+    """
+    Alpaca uses dot notation for share classes (e.g. 'BF.A'); our internal
+    tickers use hyphens (e.g. 'BF-A') for yfinance/fundamentals compatibility.
+    """
+    m = _SHARE_CLASS_RE.match(symbol)
+    return f'{m.group(1)}.{m.group(2)}' if m else symbol
 
 
 def _fetch_alpaca_bars(symbols: list[str], start: datetime, end: datetime):
@@ -54,8 +64,9 @@ def _fetch_alpaca_bars(symbols: list[str], start: datetime, end: datetime):
     """
     symbols = list(symbols)
     while symbols:
+        alpaca_to_internal = {_to_alpaca_symbol(s): s for s in symbols}
         req = StockBarsRequest(
-            symbol_or_symbols=symbols,
+            symbol_or_symbols=list(alpaca_to_internal),
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
@@ -63,11 +74,15 @@ def _fetch_alpaca_bars(symbols: list[str], start: datetime, end: datetime):
             adjustment=Adjustment.SPLIT,
         )
         try:
-            return _alpaca_client.get_stock_bars(req).df
+            raw = _alpaca_client.get_stock_bars(req).df
+            if raw is not None and not raw.empty:
+                raw = raw.rename(index=alpaca_to_internal, level='symbol')
+            return raw
         except Exception as e:
             bad = _INVALID_SYMBOL_RE.search(str(e))
-            if bad and bad.group(1) in symbols:
-                symbols.remove(bad.group(1))
+            bad_symbol = alpaca_to_internal.get(bad.group(1), bad.group(1)) if bad else None
+            if bad_symbol in symbols:
+                symbols.remove(bad_symbol)
                 continue
             print(f'  Alpaca batch failed: {e}')
             return None
@@ -104,13 +119,17 @@ def download_daily_1min(equity_symbols, crypto_symbols):
         batch_df = raw.rename_axis(['ticker', 'datetime']).swaplevel().sort_index()
         frames.append(batch_df[OHLCV_COLS])
 
-    # Binance US crypto data via vectorbtpro
+    # Binance US crypto data via vectorbtpro — fetched concurrently since
+    # Binance pages each symbol sequentially otherwise (~5 min/symbol for a
+    # full year of 1-min bars), which dominates runtime when backfilling.
     if crypto_symbols:
         vbt.BinanceData.set_custom_settings(client_config=dict(tld="us"))
         crypto_data = vbt.BinanceData.pull(
             crypto_symbols,
             start=start,
             timeframe='1m',
+            execute_kwargs=dict(engine='threadpool', engine_config=dict(init_kwargs=dict(max_workers=min(len(crypto_symbols), 30)))),
+            show_progress=False,
         )
         # vbt returns {ticker: df}; concat gives (ticker, datetime) — swap to match equities index order
         crypto_df = pd.concat(crypto_data.data).rename_axis(['ticker', 'datetime'])
