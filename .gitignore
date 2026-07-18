@@ -24,3 +24,6 @@ temp.ipynb
 
 # Research notebooks (exploratory, not part of the pipeline)
 research/
+
+# Session handoff notes (scratch, not part of the pipeline)
+handoffs/
