@@ -119,6 +119,14 @@ class LiveDataClient:
             tickers = list(self._bars.keys())
         return {ticker: self.get(ticker) for ticker in tickers}
 
+    #main return method for prelim strategies
+    def snapshot_close(self) -> pd.DataFrame:
+        """Returns Close prices for every ticker seen so far, wide-format:
+        columns = ticker, rows = datetime. Tickers with bars at different
+        timestamps are aligned on the union of datetimes seen (NaN where a
+        ticker has no bar at that time)."""
+        return pd.DataFrame({ticker: df['Close'] for ticker, df in self.snapshot().items()})
+
     def stop(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=2)

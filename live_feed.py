@@ -141,7 +141,7 @@ class RollingBarCache:
     historical data on every (re)start so the cache is never empty.
     """
 
-    def __init__(self, retention_days: float = 1.0):
+    def __init__(self, retention_days: float = 4.0):
         self._lock = threading.Lock()
         self._retention = timedelta(days=retention_days)
         self._bars: dict[str, deque] = defaultdict(deque)
