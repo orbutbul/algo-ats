@@ -27,3 +27,6 @@ research/
 
 # Session handoff notes (scratch, not part of the pipeline)
 handoffs/
+
+# Temporary alpaca live executor, for the future
+execution/alpaca_live.py

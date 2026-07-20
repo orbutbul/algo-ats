@@ -1,16 +1,16 @@
 """
-strategy_ma_cross.py — example Strategy implementation.
+strategy/ma_cross.py — example Strategy implementation.
 
 Not a real trading strategy — just enough logic (a vbt MA crossover,
 position-aware branching) to exercise every part of the Strategy/Decision
-contract in strategy_base.py / strategy_types.py.
+contract in strategy/base.py / strategy/types.py.
 """
 
 import pandas as pd
 from vectorbtpro import vbt
 
-from strategy_base import Strategy
-from strategy_types import ClosePosition, Decision, OpenOrder, OrderSide, PortfolioState
+from strategy.base import Strategy
+from strategy.types import ClosePosition, Decision, OpenOrder, OrderSide, PortfolioState
 
 
 class MovingAverageCrossStrategy(Strategy):

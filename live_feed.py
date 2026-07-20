@@ -8,14 +8,14 @@ simply has no bars to send, so it idles harmlessly rather than exiting.
 Subscribes to live 1-minute bars for the screener + conviction-watchlist
 universe via Alpaca's IEX websocket feed (free tier, real-time, single
 exchange), and republishes each bar immediately over a local ZeroMQ PUB
-socket (see live_config.PUB_ADDRESS) — one message per bar, topic-filtered
+socket (see live.config.PUB_ADDRESS) — one message per bar, topic-filtered
 by ticker, so a strategy process can subscribe to just the symbols it needs
 with sub-millisecond local latency. No parquet persistence: this process is
 push-only.
 
 Bars are also kept in a rolling in-memory cache (RollingBarCache, retention
 set by run_live_feed's history_days param, default 1 day) and served on
-request over a second socket (live_config.HISTORY_ADDRESS), so a client that
+request over a second socket (live.config.HISTORY_ADDRESS), so a client that
 connects mid-stream can catch up on recent bars before switching to the live
 PUB/SUB stream — PUB/SUB itself has no replay. On every (re)start, the cache
 is also backfilled from data/ohlcv_1min.parquet for the same history_days
@@ -38,7 +38,7 @@ To stop the task
 - Task Scheduler GUI: find /trading/liveFeed, right-click, End
 - Or taskkill /PID <pid> /F using whatever's in data/live_feed.pid (equivalent, just more manual)
 
-Consumers: use live_client.LiveDataClient rather than reading any file.
+Consumers: use live.client.LiveDataClient rather than reading any file.
 """
 
 import json
@@ -57,8 +57,8 @@ from dotenv import load_dotenv
 from alpaca.data.live import StockDataStream
 from alpaca.data.enums import DataFeed
 
-from data_ohlcv import _to_alpaca_symbol
-from live_config import PUB_ADDRESS, HISTORY_ADDRESS
+from extraction.ohlcv import _to_alpaca_symbol
+from live.config import PUB_ADDRESS, HISTORY_ADDRESS
 from utils import get_data, screen_symbols
 
 load_dotenv()

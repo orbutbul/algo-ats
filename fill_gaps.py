@@ -15,7 +15,7 @@ import pandas_market_calendars as mcal
 
 from vectorbtpro import vbt
 
-from data_ohlcv import OHLCV_PATH, OHLCV_COLS, BATCH_SIZE, _fetch_alpaca_bars
+from extraction.ohlcv import OHLCV_PATH, OHLCV_COLS, BATCH_SIZE, _fetch_alpaca_bars
 from utils import _tracked_symbols
 
 LOOKBACK_DAYS = 365

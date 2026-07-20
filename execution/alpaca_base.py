@@ -1,14 +1,13 @@
 """
-alpaca_executor_base.py — shared Alpaca order-execution logic.
+execution/alpaca_base.py — shared Alpaca order-execution logic.
 
-Consumes Decision objects from strategy_types.py and submits them via
+Consumes Decision objects from strategy/types.py and submits them via
 alpaca-py's TradingClient. Also reads current account/position/order state
 back into PortfolioState so strategy_runner.py can feed a Strategy real
 context instead of an empty placeholder.
 
-Not used directly — alpaca_paper_trading_executor.py and
-alpaca_live_trading_executor.py subclass this with their own credentials
-and paper/live flag.
+Not used directly — execution/alpaca_paper.py and execution/alpaca_live.py
+subclass this with their own credentials and paper/live flag.
 """
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -25,7 +24,7 @@ from alpaca.trading.requests import (
     ReplaceOrderRequest,
 )
 
-from strategy_types import (
+from strategy.types import (
     ClosePosition,
     Decision,
     OpenOrder,

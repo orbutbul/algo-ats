@@ -1,9 +1,9 @@
 """
-strategy_base.py — the Strategy interface.
+strategy/base.py — the Strategy interface.
 
 Any implementation takes the same symbol->OHLCV DataFrame shape produced by
-LiveDataClient.snapshot() (live_client.py) / utils.get_data(), plus current
-portfolio state, and returns a list of Decisions (strategy_types.py). This
+LiveDataClient.snapshot() (live/client.py) / utils.get_data(), plus current
+portfolio state, and returns a list of Decisions (strategy/types.py). This
 keeps every strategy's output the same shape regardless of its internal
 logic, so callers don't need to special-case which strategy produced it.
 """
@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 
 import pandas as pd
 
-from strategy_types import Decision, PortfolioState
+from strategy.types import Decision, PortfolioState
 
 
 class Strategy(ABC):

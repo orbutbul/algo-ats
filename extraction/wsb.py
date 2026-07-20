@@ -9,12 +9,12 @@ required to view it. We render the post with Playwright, read the widget's
 plain visible text, and parse it by section header.
 
 Usage:
-    from data_wsb import fetch_wsb_post, get_latest_wsb_data
+    from extraction.wsb import fetch_wsb_post, get_latest_wsb_data
     data = get_latest_wsb_data()
     df   = get_latest_wsb_data(as_df=True)  # DataFrame of biggest_movers
 
 Debug (inspect raw widget text when the app changes):
-    from data_wsb import dump_widget_text
+    from extraction.wsb import dump_widget_text
     dump_widget_text()
 """
 
@@ -535,13 +535,13 @@ def check_user(user: str = REDDIT_USER) -> None:
     Use this to verify the username and that post discovery is working.
 
     Example:
-        from data_wsb import check_user
+        from extraction.wsb import check_user
         check_user()                      # checks REDDIT_USER
         check_user("some-other-account")  # checks a different account
     """
     old = globals()["REDDIT_USER"]
     # Temporarily override so _list_posts_playwright uses the right name
-    import data_wsb as _self
+    import extraction.wsb as _self
     _self.REDDIT_USER = user
     try:
         posts = list_wsb_posts(limit=10)

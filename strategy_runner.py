@@ -8,9 +8,9 @@ AlpacaLiveTradingExecutor deliberately, never by default).
 import logging
 import time
 
-from alpaca_paper_trading_executor import AlpacaPaperTradingExecutor
-from live_client import LiveDataClient
-from strategy_ma_cross import MovingAverageCrossStrategy
+from execution.alpaca_paper import AlpacaPaperTradingExecutor
+from live.client import LiveDataClient
+from strategy.ma_cross import MovingAverageCrossStrategy
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('strategy_runner')

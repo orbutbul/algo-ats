@@ -1,10 +1,10 @@
 """
-live_client.py — subscribes to live_feed.py's ZeroMQ bar stream and
+live/client.py — subscribes to live_feed.py's ZeroMQ bar stream and
 reassembles it into per-ticker DataFrames, so strategy/indicator code can
 work with pandas the same way it does against historical data, just fed by
 push updates instead of a polled file.
 
-    from live_client import LiveDataClient
+    from live.client import LiveDataClient
 
     client = LiveDataClient(['AAPL', 'NVDA'])   # or LiveDataClient() for all
     ...
@@ -28,7 +28,7 @@ from typing import Iterable
 import pandas as pd
 import zmq
 
-from live_config import PUB_ADDRESS, HISTORY_ADDRESS
+from live.config import PUB_ADDRESS, HISTORY_ADDRESS
 
 BAR_COLUMNS = ['Open', 'High', 'Low', 'Close', 'Volume']
 HISTORY_TIMEOUT_MS = 3000

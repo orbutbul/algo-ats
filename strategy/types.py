@@ -1,12 +1,12 @@
 """
-strategy_types.py — data contracts shared by strategy_base.py and its
+strategy/types.py — data contracts shared by strategy/base.py and its
 implementations.
 
 Input side describes current broker state (positions, open orders), supplied
 by the caller — a Strategy never queries a broker itself. Output side is
 decisions only (open/update an order, close a position); no broker calls
-happen here. Consumed later by alpaca_live_trading_executor.py /
-alpaca_paper_trading_executor.py.
+happen here. Consumed later by execution/alpaca_live.py /
+execution/alpaca_paper.py.
 """
 
 from dataclasses import dataclass

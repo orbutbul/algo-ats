@@ -1,14 +1,14 @@
 """
-strategy_utils.py — helpers shared by Strategy implementations.
+strategy/utils.py — helpers shared by Strategy implementations.
 
 Strategy.on_data() must always return list[Decision] regardless of whether
-a strategy reasons about one asset at a time (strategy_ma_cross.py) or a
+a strategy reasons about one asset at a time (strategy/ma_cross.py) or a
 full-universe target-weight vector (cross-asset/cross-sectional strategies).
 weights_to_decisions() is the translation for the latter case, so
 strategy_runner.py never needs to know which kind of strategy it's driving.
 """
 
-from strategy_types import ClosePosition, Decision, OpenOrder, OrderSide, PortfolioState
+from strategy.types import ClosePosition, Decision, OpenOrder, OrderSide, PortfolioState
 
 
 def weights_to_decisions(target_weights: dict[str, float], portfolio: PortfolioState) -> list[Decision]:
