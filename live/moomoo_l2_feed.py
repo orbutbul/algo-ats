@@ -220,6 +220,41 @@ def _reconcile_subscriptions(ctx: OpenQuoteContext, store: _LatestBookStore,
     return (current_codes - to_remove) | to_add
 
 
+def _connect_with_retry(codes: set[str], handler: OrderBookHandlerBase,
+                         retry_interval: float = 5.0, max_retry_interval: float = 60.0) -> OpenQuoteContext:
+    """Retries connecting to OpenD and subscribing forever (with capped
+    backoff) instead of raising, since this feed is meant to start at boot
+    alongside OpenD itself, which can take anywhere from a few seconds to
+    much longer to be reachable (its own login, possibly including a
+    manual 2FA/OTP step, has to finish first).
+
+    Verified empirically: moomoo's own OpenQuoteContext() constructor
+    already blocks and retries internally against an unreachable OpenD
+    (observed reconnect attempts roughly every 8s, 40s+ straight, no
+    exception or timeout) — so most of the "wait for OpenD" behavior
+    happens inside the SDK before this function's own try/except ever
+    gets a chance to run. This wrapper mainly covers subscribe() failing
+    for a reason other than OpenD being unreachable (e.g. rejected before
+    OpenD is fully logged in) and guards against a future SDK version
+    changing that blocking behavior. A KeyboardInterrupt during the wait
+    propagates normally; there's no ctx yet to clean up at that point."""
+    interval = retry_interval
+    while True:
+        try:
+            ctx = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
+            ctx.set_handler(handler)
+            ret, err = ctx.subscribe(code_list=list(codes), subtype_list=[SubType.ORDER_BOOK])
+            if ret == RET_OK:
+                return ctx
+            ctx.close()
+            log.warning('Subscribe failed (%s), retrying in %.0fs...', err, interval)
+        except Exception as e:
+            log.warning('Could not reach OpenD at %s:%d (%s), retrying in %.0fs...',
+                        OPEND_HOST, OPEND_PORT, e, interval)
+        time.sleep(interval)
+        interval = min(interval * 1.5, max_retry_interval)
+
+
 def run_feed(tickers: list[str] | None = None, tickers_file: str = str(TICKERS_PATH),
              out_dir: str = str(DATA_DIR),
              max_levels: int = MAX_LEVELS,
@@ -250,12 +285,7 @@ def run_feed(tickers: list[str] | None = None, tickers_file: str = str(TICKERS_P
     PID_PATH.write_text(str(os.getpid()))
     log.info('PID %d written to %s', os.getpid(), PID_PATH)
 
-    ctx = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
-    ctx.set_handler(_Handler())
-    ret, err = ctx.subscribe(code_list=list(codes), subtype_list=[SubType.ORDER_BOOK])
-    if ret != RET_OK:
-        ctx.close()
-        raise RuntimeError(f'subscribe failed: {err}')
+    ctx = _connect_with_retry(codes, _Handler())
     log.info('Subscribed to %d tickers for Level 2 order book (watching %s for changes)',
               len(codes), tickers_path)
 
