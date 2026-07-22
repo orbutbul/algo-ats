@@ -1,6 +1,6 @@
 """
 live/moomoo_l2_feed.py — long-running process that subscribes to moomoo
-Level 2 order book pushes for a given ticker list and persists snapshots to
+Level 2 order book pushes for a ticker list and persists snapshots to
 Parquet under data/moomoo_l2/<date>/.
 
 Requires OpenD running and logged in (see live/moomoo_l2.py's module
@@ -9,6 +9,23 @@ docstring for setup). Run directly:
     python -m live.moomoo_l2_feed AAPL,NVDA,MSFT
 
 or import run_feed(tickers) to embed it elsewhere.
+
+The ticker list is live-editable while the feed runs: it's backed by a
+plain text file (default data/moomoo_l2_tickers.txt, one ticker per line,
+same '#'-comment convention as live_feed.py's conviction_watchlist.txt).
+If `tickers` is passed to run_feed()/the CLI and the file doesn't exist
+yet, it's created from that list; from then on the file is the source of
+truth. Edit and save it while the feed is running and it'll pick up the
+change within RECONCILE_INTERVAL_S — diffs the new list against the
+current subscriptions, unsubscribes tickers that dropped off, subscribes
+new ones, and drops cached book state for removed tickers so stale rows
+don't keep flowing into the next flush. The file (a handful of lines) is
+re-read and diffed on every RECONCILE_INTERVAL_S tick regardless of
+whether it changed — negligible cost, and necessary rather than merely
+simple: moomoo rejects unsubscribe for a ticker held under ~1 minute
+("OrderBook subscription duration ... too short"), so a removal can fail
+on its first attempt and must be retried on a later tick even though the
+file itself hasn't changed again since.
 
 Design notes (see conversation history / benchmarking in
 scratch_setup/moomoo_l2_size_test.py for the numbers behind these choices):
@@ -58,8 +75,10 @@ OPEND_PORT = 11111
 MAX_LEVELS = 10          # per side; deeper books get bucketed down to this
 SNAPSHOT_INTERVAL_S = 1.0
 FLUSH_INTERVAL_S = 30.0
+RECONCILE_INTERVAL_S = 5.0
 
 DATA_DIR = Path('data/moomoo_l2')
+TICKERS_PATH = Path('data/moomoo_l2_tickers.txt')
 PID_PATH = Path('data/moomoo_l2_feed.pid')
 LOG_DIR = Path('logs')
 
@@ -119,6 +138,30 @@ class _LatestBookStore:
         with self._lock:
             return dict(self._books)
 
+    def drop(self, code: str) -> None:
+        with self._lock:
+            self._books.pop(code, None)
+
+
+def read_tickers_file(path: Path) -> list[str]:
+    """One ticker per line, '#' comments and blank lines ignored — same
+    convention as live_feed.py's read_watchlist(). Missing file returns []
+    rather than erroring, since run_feed bootstraps it from the tickers
+    argument on first run."""
+    if not path.exists():
+        return []
+    tickers = []
+    for line in path.read_text().splitlines():
+        line = line.split('#', 1)[0].strip().upper()
+        if line:
+            tickers.append(line)
+    return tickers
+
+
+def write_tickers_file(path: Path, tickers: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(tickers) + '\n')
+
 
 class _ParquetDayWriter:
     """Writes each flush as its own complete Parquet file under a
@@ -141,11 +184,56 @@ class _ParquetDayWriter:
         pass  # no persistent handle to release
 
 
-def run_feed(tickers: list[str], out_dir: str = str(DATA_DIR),
+def _reconcile_subscriptions(ctx: OpenQuoteContext, store: _LatestBookStore,
+                              current_codes: set[str], tickers_file: Path) -> set[str]:
+    """Diffs tickers_file's contents against current_codes and subscribes/
+    unsubscribes the difference. Returns the new current_codes set — on a
+    partial failure (add or remove call rejected by OpenD), that half of
+    the diff is left out of the returned set so it's retried next check
+    rather than assumed to have succeeded."""
+    new_codes = {f'US.{t}' for t in read_tickers_file(tickers_file)}
+    to_add = new_codes - current_codes
+    to_remove = current_codes - new_codes
+
+    if to_remove:
+        ret, err = ctx.unsubscribe(code_list=list(to_remove), subtype_list=[SubType.ORDER_BOOK])
+        if ret != RET_OK:
+            if 'too short' in str(err).lower():
+                log.info('Deferring unsubscribe for %s - under moomoo minimum hold '
+                          '(~1min), will retry: %s', sorted(to_remove), err)
+            else:
+                log.warning('unsubscribe failed for %s: %s', sorted(to_remove), err)
+            to_remove = set()
+        else:
+            for code in to_remove:
+                store.drop(code)
+            log.info('Unsubscribed %d ticker(s): %s', len(to_remove), sorted(to_remove))
+
+    if to_add:
+        ret, err = ctx.subscribe(code_list=list(to_add), subtype_list=[SubType.ORDER_BOOK])
+        if ret != RET_OK:
+            log.warning('subscribe failed for %s: %s', sorted(to_add), err)
+            to_add = set()
+        else:
+            log.info('Subscribed %d new ticker(s): %s', len(to_add), sorted(to_add))
+
+    return (current_codes - to_remove) | to_add
+
+
+def run_feed(tickers: list[str] | None = None, tickers_file: str = str(TICKERS_PATH),
+             out_dir: str = str(DATA_DIR),
              max_levels: int = MAX_LEVELS,
              snapshot_interval: float = SNAPSHOT_INTERVAL_S,
-             flush_interval: float = FLUSH_INTERVAL_S) -> None:
-    codes = [f'US.{t}' for t in tickers]
+             flush_interval: float = FLUSH_INTERVAL_S,
+             reconcile_interval: float = RECONCILE_INTERVAL_S) -> None:
+    tickers_path = Path(tickers_file)
+    if not tickers_path.exists():
+        if not tickers:
+            raise ValueError(f'{tickers_path} does not exist and no tickers were passed to bootstrap it')
+        write_tickers_file(tickers_path, tickers)
+        log.info('Created %s from the passed-in ticker list', tickers_path)
+
+    codes = {f'US.{t}' for t in read_tickers_file(tickers_path)}
     store = _LatestBookStore()
 
     class _Handler(OrderBookHandlerBase):
@@ -164,15 +252,17 @@ def run_feed(tickers: list[str], out_dir: str = str(DATA_DIR),
 
     ctx = OpenQuoteContext(host=OPEND_HOST, port=OPEND_PORT)
     ctx.set_handler(_Handler())
-    ret, err = ctx.subscribe(code_list=codes, subtype_list=[SubType.ORDER_BOOK])
+    ret, err = ctx.subscribe(code_list=list(codes), subtype_list=[SubType.ORDER_BOOK])
     if ret != RET_OK:
         ctx.close()
         raise RuntimeError(f'subscribe failed: {err}')
-    log.info('Subscribed to %d tickers for Level 2 order book', len(codes))
+    log.info('Subscribed to %d tickers for Level 2 order book (watching %s for changes)',
+              len(codes), tickers_path)
 
     writer = _ParquetDayWriter(Path(out_dir))
     buffer_rows: list[tuple] = []
     last_flush = time.monotonic()
+    last_reconcile = time.monotonic()
     stop_event = threading.Event()
 
     def _flush():
@@ -195,12 +285,16 @@ def run_feed(tickers: list[str], out_dir: str = str(DATA_DIR),
 
             if time.monotonic() - last_flush >= flush_interval:
                 _flush()
+
+            if time.monotonic() - last_reconcile >= reconcile_interval:
+                last_reconcile = time.monotonic()
+                codes = _reconcile_subscriptions(ctx, store, codes, tickers_path)
     except KeyboardInterrupt:
         log.info('Stopping feed (KeyboardInterrupt)...')
     finally:
         _flush()
         writer.close()
-        ctx.unsubscribe(code_list=codes, subtype_list=[SubType.ORDER_BOOK])
+        ctx.unsubscribe(code_list=list(codes), subtype_list=[SubType.ORDER_BOOK])
         ctx.close()
         if PID_PATH.exists():
             PID_PATH.unlink()
@@ -212,5 +306,6 @@ if __name__ == '__main__':
         tickers_arg = [t.strip().upper() for t in sys.argv[1].split(',') if t.strip()]
     else:
         tickers_arg = ['AAPL', 'NVDA']
-        log.info('No tickers passed on the command line, defaulting to %s', tickers_arg)
+        log.info('No tickers passed on the command line, using %s if %s needs to be created',
+                  tickers_arg, TICKERS_PATH)
     run_feed(tickers_arg)
