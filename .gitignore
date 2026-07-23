@@ -28,5 +28,8 @@ research/
 # Session handoff notes (scratch, not part of the pipeline)
 handoffs/
 
+# Agent session handoff notes (scratch, not part of the pipeline)
+agentic/
+
 # Temporary alpaca live executor, for the future
 execution/alpaca_live.py
