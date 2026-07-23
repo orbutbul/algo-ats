@@ -414,9 +414,12 @@ def _list_posts_oauth(token: str, limit: int) -> list[dict]:
 
 def _list_posts_playwright(limit: int) -> list[dict]:
     """
-    Find 'What Are Your Moves' posts on r/wallstreetbets via old.reddit.com.
-    old Reddit is server-rendered HTML so selectors are stable.
-    Returns www.reddit.com URLs so the widget can be rendered directly.
+    Read u/verified-trader's own submitted-posts page on www.reddit.com.
+
+    old.reddit.com now redirects anonymous visitors to a login wall, so it
+    can no longer be scraped without auth. www.reddit.com still renders a
+    user's public profile for logged-out visitors, listing posts as
+    <shreddit-post> custom elements with the fields we need as attributes.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -426,26 +429,22 @@ def _list_posts_playwright(limit: int) -> list[dict]:
                 "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
             )
         )
-        page.goto("https://old.reddit.com/r/wallstreetbets/", wait_until="domcontentloaded", timeout=45_000)
+        page.goto(f"https://www.reddit.com/user/{REDDIT_USER}/submitted/", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(3_000)
 
         collected = []
-        for thing in page.query_selector_all("div.thing[data-fullname]"):
-            title_el = thing.query_selector("a.title")
-            if not title_el:
+        for el in page.query_selector_all("shreddit-post"):
+            title      = (el.get_attribute("post-title") or "").strip()
+            permalink  = el.get_attribute("permalink") or ""
+            ts         = el.get_attribute("created-timestamp")
+            fullname   = el.get_attribute("id") or ""
+            post_id    = fullname[3:] if fullname.startswith("t3_") else fullname
+
+            if not title or not permalink:
                 continue
-            title = title_el.inner_text().strip()
-            if "what are your moves" not in title.lower():
-                continue
 
-            href    = title_el.get_attribute("href") or ""
-            ts      = thing.get_attribute("data-timestamp")
-            post_id = (thing.get_attribute("data-fullname") or "")[3:]
-
-            full_url = href.replace("old.reddit.com", "www.reddit.com")
-            if full_url.startswith("/"):
-                full_url = f"https://www.reddit.com{full_url}"
-
-            created = (datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+            full_url = permalink if permalink.startswith("http") else f"https://www.reddit.com{permalink}"
+            created = (datetime.fromisoformat(ts.replace("Z", "+00:00"))
                        if ts else datetime.now(tz=timezone.utc))
             collected.append({"id": post_id, "title": title, "url": full_url, "created_utc": created})
             if len(collected) >= limit:
@@ -595,76 +594,73 @@ _FILES = {
 
 def save_wsb_data(data: dict) -> None:
     """
-    Append this run's WSB snapshot to the parquet files in data/wsb/, tagged
-    with the UTC hour it was captured in. Safe to call multiple times within
-    the same hour — existing rows for that (date, hour) are replaced; calls
-    in different hours of the same day both accumulate, building an intraday
-    history rather than overwriting the day's only snapshot.
+    Append this run's WSB snapshot to the parquet files in data/wsb/. The
+    `date` column is a local-time timestamp truncated to the hour it was
+    captured in, so calls within the same hour replace that hour's row while
+    calls in different hours of the same day both accumulate — building an
+    intraday history rather than overwriting the day's only snapshot.
     """
     WSB_DIR.mkdir(parents=True, exist_ok=True)
 
-    now = datetime.now(timezone.utc)
-    date = now.date()
-    hour = now.hour
+    date = datetime.now().replace(minute=0, second=0, microsecond=0)
 
     # --- sentiment (one row per hour: both directions' overall score) ---
     sent = data.get("sentiment", {})
     sent_row = {
         "date": date,
-        "hour": hour,
         "bearish_pct": sent.get("bearish_pct"),
         "bullish_pct": sent.get("bullish_pct"),
     }
-    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date", "hour"])
+    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date"])
 
     for direction in ("most_bearish", "most_bullish"):
-        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+        rows = [{"date": date, "rank": i + 1, **r}
                 for i, r in enumerate(sent.get(direction, []))]
         if rows:
-            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "hour", "rank"])
+            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "rank"])
 
     # --- top_holdings ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+    rows = [{"date": date, "rank": i + 1, **r}
             for i, r in enumerate(data.get("top_holdings", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "hour", "rank"])
+        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "rank"])
 
     # --- top_trades ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+    rows = [{"date": date, "rank": i + 1, **r}
             for i, r in enumerate(data.get("top_trades", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "hour", "rank"])
+        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "rank"])
 
     # --- biggest_movers ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+    rows = [{"date": date, "rank": i + 1, **r}
             for i, r in enumerate(data.get("biggest_movers", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "hour", "rank"])
+        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "rank"])
 
     # --- mentions ---
     rows = []
     for i, m in enumerate(data.get("mentions", [])):
         ticker = m.get("ticker", "")
         if ticker:
-            rows.append({"date": date, "hour": hour, "rank": i + 1, "ticker": ticker,
+            rows.append({"date": date, "rank": i + 1, "ticker": ticker,
                          "price": m.get("price"), "change_pct": m.get("change_pct"),
                          "count": m.get("count")})
     if rows:
-        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "hour", "ticker"])
+        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "ticker"])
 
     # --- leaderboard (by comments, and by streak length) ---
     lb = data.get("leaderboard", {})
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+    rows = [{"date": date, "rank": i + 1, **r}
             for i, r in enumerate(lb.get("by_comments", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "hour", "rank"])
+        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "rank"])
 
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+    rows = [{"date": date, "rank": i + 1, **r}
             for i, r in enumerate(lb.get("by_streak", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "hour", "rank"])
+        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "rank"])
 
-    print(f"Saved WSB data for {date} {hour:02d}:00 UTC -> {WSB_DIR}/")
+    print(f"Saved WSB data for {date} -> {WSB_DIR}/")
 
 
 def _append(new_df: pd.DataFrame, path: Path, dedup_cols: list[str]) -> None:
