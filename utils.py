@@ -15,7 +15,10 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 
 # --- Paths ---
-OHLCV_PATH = Path('data/ohlcv_1min.parquet')   # 1-minute OHLCV bars for all asset classes
+# Anchored to this file's location (not the caller's cwd) so imports from
+# research/ notebooks, whose Jupyter kernel cwd is the notebook's own
+# directory rather than the project root, still resolve correctly.
+OHLCV_PATH = Path(__file__).parent / 'data' / 'ohlcv_1min.parquet'   # 1-minute OHLCV bars for all asset classes
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 BATCH_SIZE = 100                                # tickers per yfinance download call
 

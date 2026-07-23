@@ -1,47 +1,25 @@
 """
 fill_gaps.py — one-off maintenance script, run manually: `python fill_gaps.py`.
 
-Scans the last year of data/ohlcv_1min.parquet, from 365 days ago through
-now, for entire missing trading/calendar days per symbol — including days
-before a symbol was first tracked, so every currently tracked symbol ends
-up with a full year of history — and backfills exactly those gaps, via
-Alpaca for equities/ETFs and Binance for crypto.
+Scans the last year of data/ohlcv_1min.parquet for gaps per tracked symbol —
+both entire missing trading/calendar days and days whose intra-day minute
+coverage falls below gap_detection.FILL_THRESHOLD — including days before a
+symbol was first tracked, so every currently tracked symbol ends up with a
+full year of history. Backfills exactly those (ticker, day)s, refetching the
+whole day and letting the existing dedupe-on-index-keep-last merge fill in
+whatever was actually missing, via Alpaca for equities/ETFs and Binance for
+crypto.
 """
 
 from datetime import datetime, time, timedelta, timezone
 
 import pandas as pd
-import pandas_market_calendars as mcal
 
 from vectorbtpro import vbt
 
 from extraction.ohlcv import OHLCV_PATH, OHLCV_COLS, BATCH_SIZE, _fetch_alpaca_bars
 from utils import _tracked_symbols
-
-LOOKBACK_DAYS = 365
-
-
-def _present_dates(df: pd.DataFrame) -> dict[str, set]:
-    """{ticker: set of dates with data}."""
-    present = pd.DataFrame({
-        'ticker': df.index.get_level_values('ticker'),
-        'date': df.index.get_level_values('datetime').date,
-    }).drop_duplicates()
-    return present.groupby('ticker')['date'].apply(set).to_dict()
-
-
-def _missing_days(tickers, valid_days, present_by_ticker) -> dict[str, list]:
-    """Missing days for every tracked symbol across the full valid_days range,
-    including days before the symbol's first recorded date, so every symbol
-    ends up with a full year of history rather than just gap-free coverage
-    within whatever range it already has."""
-    missing = {}
-    for ticker in tickers:
-        present = present_by_ticker.get(ticker, set())
-        gaps = [d for d in valid_days if d not in present]
-        if gaps:
-            missing[ticker] = gaps
-    return missing
+from gap_detection import load_or_build_gap_report, LOOKBACK_DAYS, crypto_valid_days
 
 
 def _group_contiguous(missing: dict[str, list], valid_days: list) -> list[tuple]:
@@ -96,22 +74,31 @@ def fill_gaps() -> None:
         return
 
     df = pd.read_parquet(OHLCV_PATH)
-    present_by_ticker = _present_dates(df)
-
-    tracked = _tracked_symbols()
-    equity_tickers = tracked['equities'] + tracked['etfs']
-    crypto_tickers = tracked['cryptos']
+    if list(df.columns) != OHLCV_COLS:
+        df = df[OHLCV_COLS]  # drops the stray all-NaN 'adj close' column, if present
+        df.to_parquet(OHLCV_PATH)
 
     today = datetime.now(timezone.utc).date()
     cutoff_start = today - timedelta(days=LOOKBACK_DAYS)
-    cutoff_end = today  # today included — catches a gap even if daily_run.py hasn't run yet today
 
-    nyse = mcal.get_calendar('NYSE')
-    equity_valid_days = list(nyse.schedule(start_date=cutoff_start.isoformat(), end_date=cutoff_end.isoformat()).index.date)
-    crypto_valid_days = list(pd.date_range(cutoff_start, cutoff_end, freq='D').date)
+    # Manual maintenance script — always recompute fresh rather than risk
+    # acting on a stale cached report (contrast with dashboard.py's default
+    # cache reuse).
+    gap_report = load_or_build_gap_report(force=True)
+    to_refetch = gap_report[gap_report['needs_refetch']].reset_index()
 
-    equity_missing = _missing_days(equity_tickers, equity_valid_days, present_by_ticker)
-    crypto_missing = _missing_days(crypto_tickers, crypto_valid_days, present_by_ticker)
+    equity_missing = (
+        to_refetch[to_refetch['asset_class'].isin(['equities', 'etfs'])]
+        .groupby('ticker')['date'].apply(list).to_dict()
+    )
+    crypto_missing = (
+        to_refetch[to_refetch['asset_class'] == 'cryptos']
+        .groupby('ticker')['date'].apply(list).to_dict()
+    )
+    whole_day_gaps = int(to_refetch['is_whole_day_gap'].sum())
+    intraday_gaps = len(to_refetch) - whole_day_gaps
+
+    crypto_days = crypto_valid_days(cutoff_start, today)
 
     # Equities are batched by symbol (not by contiguous identical-missing-set
     # day ranges): each batch fetches the full min->max span of its gaps in
@@ -122,10 +109,11 @@ def fill_gaps() -> None:
     # single-day ones).
     equity_gapped = sorted(equity_missing)
     equity_batches = [equity_gapped[i:i + BATCH_SIZE] for i in range(0, len(equity_gapped), BATCH_SIZE)]
-    crypto_groups = _group_contiguous(crypto_missing, crypto_valid_days)
+    crypto_groups = _group_contiguous(crypto_missing, crypto_days)
 
     print(f'{len(equity_missing)} equity/ETF symbols with gaps, {len(equity_batches)} batch(es)')
     print(f'{len(crypto_missing)} crypto symbols with gaps, {len(crypto_groups)} backfill range(s)')
+    print(f'{whole_day_gaps} whole-day gap(s), {intraday_gaps} additional (ticker, day)s refetched due to low intra-day completeness')
 
     total_new_rows = 0
 
