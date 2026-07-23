@@ -6,7 +6,8 @@ Runs, independently of one another (a failure in one does not block the rest):
   2. 1-minute OHLCV for today (equities, ETFs, crypto)
   3. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale;
      includes crypto via CoinGecko now, same staleness-gated cadence)
-  4. WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
+
+WSB widget data runs separately, hourly — see hourly_run.py.
 """
 
 import logging
@@ -20,7 +21,6 @@ import pandas_market_calendars as mcal
 from utils import screen_symbols
 from extraction.ohlcv import download_daily_1min
 from extraction.fundamentals import fundamentals, FUNDAMENTALS_SPECS
-from extraction.wsb import get_latest_wsb_data, save_wsb_data
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,17 +98,6 @@ def run():
         except Exception:
             errors.append('fundamentals')
             log.error(traceback.format_exc())
-
-    # ------------------------------------------------------------------
-    # 4. WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
-    # ------------------------------------------------------------------
-    log.info('--- WSB data ---')
-    try:
-        wsb_data = get_latest_wsb_data(post_type='moves')
-        save_wsb_data(wsb_data)
-    except Exception:
-        errors.append('WSB data')
-        log.error(traceback.format_exc())
 
     # ------------------------------------------------------------------
     # Summary
