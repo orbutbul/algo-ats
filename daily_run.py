@@ -4,7 +4,8 @@ daily_run.py — scheduled via Windows Task Scheduler at 5:00 PM ET.
 Runs, independently of one another (a failure in one does not block the rest):
   1. Symbol screening (equities/ETFs/cryptos — feeds sections 2 and 3)
   2. 1-minute OHLCV for today (equities, ETFs, crypto)
-  3. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale)
+  3. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale;
+     includes crypto via CoinGecko now, same staleness-gated cadence)
   4. WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
 """
 
@@ -87,7 +88,7 @@ def run():
     # ------------------------------------------------------------------
     # 3. Fundamentals (staleness-aware, only runs what needs updating)
     # ------------------------------------------------------------------
-    log.info('--- Fundamentals ---')
+    log.info('--- Fundamentals (equities/ETFs via yfinance, crypto via CoinGecko) ---')
     if screen is None:
         errors.append('fundamentals (skipped — symbol screening failed)')
         log.warning('Skipping — symbol screening failed.')

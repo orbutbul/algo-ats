@@ -62,16 +62,21 @@ ETF_MONTHLY_FIELDS = [
     "annualReportExpenseRatio", # fund expense ratio (almost never changes)
 ]
 
-# yfinance crypto coverage is thin — no on-chain data, just market stats
+# yfinance crypto coverage is too thin to rely on (no on-chain data, spotty
+# ticker matches) — crypto fundamentals are sourced from CoinGecko instead
+# (see fetch_crypto_fundamentals below), whose native field names are
+# snake_case rather than the yfinance-derived camelCase used for
+# equities/ETFs above. volume24Hr isn't a CoinGecko /coins/markets field;
+# total_volume is the equivalent.
 CRYPTO_DAILY_FIELDS = [
-    "marketCap",            # price * circulating supply
-    "circulatingSupply",    
-    "volume24Hr",   
+    "market_cap",            # price * circulating supply
+    "circulating_supply",
+    "market_cap_rank",
 ]
 
 CRYPTO_MONTHLY_FIELDS = [
-    "maxSupply",    
-    "totalSupply",  
+    "max_supply",
+    "total_supply",
 ]
 
 # Master config: maps each asset class to its freq → fields schedule.
@@ -87,10 +92,10 @@ FUNDAMENTALS_SPECS = {
         'weekly':  ETF_WEEKLY_FIELDS,
         'monthly': ETF_MONTHLY_FIELDS,
     },
-    # 'cryptos': {
-    #     'daily':   CRYPTO_DAILY_FIELDS,
-    #     'monthly': CRYPTO_MONTHLY_FIELDS,
-    # },
+    'cryptos': {
+        'daily':   CRYPTO_DAILY_FIELDS,
+        'monthly': CRYPTO_MONTHLY_FIELDS,
+    },
 }
 
 # Minimum age (days) before a cached parquet is considered stale
@@ -98,6 +103,160 @@ FREQ_STALENESS_DAYS = {'daily': 1, 'weekly': 7, 'monthly': 30}
 
 
 
+
+
+COINGECKO_BASE = 'https://api.coingecko.com/api/v3'
+COINGECKO_COINS_LIST_PATH = FUNDAMENTALS_DIR / 'coingecko_coins_list.json'
+CRYPTO_UNMATCHED_PATH = FUNDAMENTALS_DIR / 'crypto_unmatched.json'
+# CoinGecko free tier is roughly 10-30 calls/min (undocumented precisely) —
+# 2.5s between calls keeps us well under that with margin for retries.
+COINGECKO_RATE_LIMIT_DELAY = 2.5
+
+# Same quote-asset suffixes utils._tracked_symbols() uses to detect crypto
+# tickers, reused here so "what counts as a quote-asset suffix" has exactly
+# one definition in the codebase.
+_QUOTE_ASSET_RE = re.compile(r'(USDT|BUSD|BTC|ETH|BNB)$')
+
+
+def _base_asset(binance_symbol: str) -> str:
+    """'BTCUSDT' -> 'BTC'."""
+    return _QUOTE_ASSET_RE.sub('', binance_symbol)
+
+
+def _fetch_coingecko_coins_list(force: bool = False) -> pd.DataFrame:
+    """GET /coins/list — full id/symbol/name universe (~15k rows), cached
+    under the same 'daily' staleness rule as everything else."""
+    if not force and not _needs_update(COINGECKO_COINS_LIST_PATH, 'daily'):
+        with open(COINGECKO_COINS_LIST_PATH, encoding='utf-8') as f:
+            return pd.DataFrame(json.load(f))
+
+    resp = requests.get(f'{COINGECKO_BASE}/coins/list')
+    resp.raise_for_status()
+    coins = resp.json()
+
+    COINGECKO_COINS_LIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(COINGECKO_COINS_LIST_PATH, 'w', encoding='utf-8') as f:
+        json.dump(coins, f)
+    return pd.DataFrame(coins)
+
+
+def _fetch_coingecko_markets(coin_ids: list[str], vs_currency: str = 'usd',
+                              delay: float = COINGECKO_RATE_LIMIT_DELAY, retries: int = 3) -> pd.DataFrame:
+    """GET /coins/markets, batched at 250 ids/call (CoinGecko's per_page max)."""
+    frames = []
+    for i in range(0, len(coin_ids), 250):
+        batch = coin_ids[i:i + 250]
+        for attempt in range(retries):
+            try:
+                resp = requests.get(f'{COINGECKO_BASE}/coins/markets', params={
+                    'vs_currency': vs_currency,
+                    'ids': ','.join(batch),
+                    'per_page': 250,
+                })
+                resp.raise_for_status()
+                frames.append(pd.DataFrame(resp.json()))
+                time.sleep(delay)
+                break
+            except Exception as e:
+                if attempt < retries - 1:
+                    wait = delay * 2 ** attempt
+                    print(f'  CoinGecko markets batch failed, retrying in {wait:.1f}s: {e}')
+                    time.sleep(wait)
+                else:
+                    print(f'  skipping CoinGecko markets batch after {retries} attempts: {e}')
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _map_symbols_to_coingecko_ids(binance_symbols: list[str], coins_list: pd.DataFrame) -> tuple[dict, list]:
+    """
+    Maps Binance ticker (e.g. 'BTCUSDT') -> CoinGecko coin id (e.g. 'bitcoin').
+    Collisions (multiple coins sharing a symbol) are resolved by picking the
+    candidate with the best (lowest) market_cap_rank.
+    Returns (symbol_to_id, unmatched_bases).
+    """
+    coins_list = coins_list.copy()
+    coins_list['symbol'] = coins_list['symbol'].str.upper()
+    by_symbol = coins_list.groupby('symbol')['id'].apply(list).to_dict()
+
+    base_by_symbol = {s: _base_asset(s) for s in binance_symbols}
+    candidates_by_base = {}
+    unmatched = []
+    for symbol, base in base_by_symbol.items():
+        ids = by_symbol.get(base)
+        if not ids:
+            unmatched.append(base)
+        else:
+            candidates_by_base[base] = ids
+
+    # Only fetch market data (for rank-based disambiguation) for bases with
+    # more than one candidate — the common case (single match) needs no
+    # extra API call.
+    ambiguous_ids = [cid for ids in candidates_by_base.values() if len(ids) > 1 for cid in ids]
+    rank_by_id = {}
+    if ambiguous_ids:
+        markets = _fetch_coingecko_markets(ambiguous_ids)
+        if not markets.empty:
+            rank_by_id = markets.set_index('id')['market_cap_rank'].to_dict()
+
+    resolved_by_base = {}
+    for base, ids in candidates_by_base.items():
+        if len(ids) == 1:
+            resolved_by_base[base] = ids[0]
+        else:
+            resolved_by_base[base] = min(ids, key=lambda cid: rank_by_id.get(cid) or float('inf'))
+
+    symbol_to_id = {
+        symbol: resolved_by_base[base]
+        for symbol, base in base_by_symbol.items()
+        if base in resolved_by_base
+    }
+    return symbol_to_id, unmatched
+
+
+def fetch_crypto_fundamentals(binance_symbols: list[str], force: bool = False) -> pd.DataFrame:
+    """
+    Fetches crypto fundamentals from CoinGecko for a list of Binance tickers
+    (e.g. 'BTCUSDT'). Returns a DataFrame indexed by the original Binance
+    ticker with columns market_cap, circulating_supply, market_cap_rank,
+    max_supply, total_supply, plus coingecko_id for traceability.
+    Tickers that can't be matched to a CoinGecko coin are omitted here and
+    logged to CRYPTO_UNMATCHED_PATH.
+    """
+    if not binance_symbols:
+        return pd.DataFrame()
+
+    coins_list = _fetch_coingecko_coins_list(force=force)
+    symbol_to_id, unmatched = _map_symbols_to_coingecko_ids(binance_symbols, coins_list)
+
+    FUNDAMENTALS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CRYPTO_UNMATCHED_PATH, 'w', encoding='utf-8') as f:
+        json.dump({'unmatched_bases': unmatched, 'checked_at': datetime.now(timezone.utc).isoformat()}, f, indent=2)
+
+    if not symbol_to_id:
+        return pd.DataFrame()
+
+    markets = _fetch_coingecko_markets(list(set(symbol_to_id.values())))
+    if markets.empty:
+        return pd.DataFrame()
+
+    markets = markets.set_index('id')
+    rows = []
+    for symbol, coin_id in symbol_to_id.items():
+        if coin_id not in markets.index:
+            continue
+        m = markets.loc[coin_id]
+        rows.append({
+            'ticker': symbol,
+            'coingecko_id': coin_id,
+            'market_cap': m.get('market_cap'),
+            'circulating_supply': m.get('circulating_supply'),
+            'market_cap_rank': m.get('market_cap_rank'),
+            'max_supply': m.get('max_supply'),
+            'total_supply': m.get('total_supply'),
+        })
+    return pd.DataFrame(rows).set_index('ticker')
 
 
 def _needs_update(path: Path, freq: str) -> bool:
@@ -168,7 +327,11 @@ def fundamentals(symbols: dict, specs: dict = FUNDAMENTALS_SPECS, force: bool = 
                 print(f'{asset_class}/{freq}: loaded cache ({path})')
                 continue
             print(f'{asset_class}/{freq}: fetching {len(fields)} fields for {len(tickers)} tickers...')
-            df = _fetch_fields(tickers, fields)
+            if asset_class == 'cryptos':
+                df = fetch_crypto_fundamentals(tickers, force=force)
+                df = df[[f for f in fields if f in df.columns]]
+            else:
+                df = _fetch_fields(tickers, fields)
             df.to_parquet(path)
             print(f'{asset_class}/{freq}: saved {len(df)} rows to {path}')
             results[asset_class][freq] = df
