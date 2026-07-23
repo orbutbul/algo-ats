@@ -595,76 +595,76 @@ _FILES = {
 
 def save_wsb_data(data: dict) -> None:
     """
-    Append today's WSB snapshot to the parquet files in data/wsb/.
-    Safe to call multiple times on the same day — existing rows are replaced.
+    Append this run's WSB snapshot to the parquet files in data/wsb/, tagged
+    with the UTC hour it was captured in. Safe to call multiple times within
+    the same hour — existing rows for that (date, hour) are replaced; calls
+    in different hours of the same day both accumulate, building an intraday
+    history rather than overwriting the day's only snapshot.
     """
     WSB_DIR.mkdir(parents=True, exist_ok=True)
 
-    post_date = data.get("post_date")
-    if isinstance(post_date, datetime):
-        date = post_date.date()
-    elif post_date is not None:
-        date = pd.Timestamp(post_date).date()
-    else:
-        date = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    date = now.date()
+    hour = now.hour
 
-    # --- sentiment (single row per day: both directions' overall score) ---
+    # --- sentiment (one row per hour: both directions' overall score) ---
     sent = data.get("sentiment", {})
     sent_row = {
         "date": date,
+        "hour": hour,
         "bearish_pct": sent.get("bearish_pct"),
         "bullish_pct": sent.get("bullish_pct"),
     }
-    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date"])
+    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date", "hour"])
 
     for direction in ("most_bearish", "most_bullish"):
-        rows = [{"date": date, "rank": i + 1, **r}
+        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
                 for i, r in enumerate(sent.get(direction, []))]
         if rows:
-            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "rank"])
+            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "hour", "rank"])
 
     # --- top_holdings ---
-    rows = [{"date": date, "rank": i + 1, **r}
+    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
             for i, r in enumerate(data.get("top_holdings", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "rank"])
+        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "hour", "rank"])
 
     # --- top_trades ---
-    rows = [{"date": date, "rank": i + 1, **r}
+    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
             for i, r in enumerate(data.get("top_trades", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "rank"])
+        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "hour", "rank"])
 
     # --- biggest_movers ---
-    rows = [{"date": date, "rank": i + 1, **r}
+    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
             for i, r in enumerate(data.get("biggest_movers", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "rank"])
+        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "hour", "rank"])
 
     # --- mentions ---
     rows = []
     for i, m in enumerate(data.get("mentions", [])):
         ticker = m.get("ticker", "")
         if ticker:
-            rows.append({"date": date, "rank": i + 1, "ticker": ticker,
+            rows.append({"date": date, "hour": hour, "rank": i + 1, "ticker": ticker,
                          "price": m.get("price"), "change_pct": m.get("change_pct"),
                          "count": m.get("count")})
     if rows:
-        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "ticker"])
+        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "hour", "ticker"])
 
     # --- leaderboard (by comments, and by streak length) ---
     lb = data.get("leaderboard", {})
-    rows = [{"date": date, "rank": i + 1, **r}
+    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
             for i, r in enumerate(lb.get("by_comments", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "rank"])
+        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "hour", "rank"])
 
-    rows = [{"date": date, "rank": i + 1, **r}
+    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
             for i, r in enumerate(lb.get("by_streak", []))]
     if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "rank"])
+        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "hour", "rank"])
 
-    print(f"Saved WSB data for {date} -> {WSB_DIR}/")
+    print(f"Saved WSB data for {date} {hour:02d}:00 UTC -> {WSB_DIR}/")
 
 
 def _append(new_df: pd.DataFrame, path: Path, dedup_cols: list[str]) -> None:
