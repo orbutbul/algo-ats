@@ -2,14 +2,20 @@
 extraction/ohlcv_massive.py — one-off historical backfill of 1-min equity/ETF
 OHLCV bars from Massive (formerly Polygon.io), replacing the sparse
 Alpaca/IEX-sourced history. Rate-limited to the free tier's 5 calls/min,
-resumable via a per-ticker progress ledger, checkpointed to a staging
-parquet. Run manually: `python -m extraction.ohlcv_massive`.
+resumable via a per-ticker progress ledger, checkpointed into a DuckDB
+staging table (data/ohlcv.duckdb::massive_1min). Run manually:
+`python -m extraction.ohlcv_massive`.
+
+DuckDB (not parquet) is the staging store specifically so each checkpoint can
+append a batch with a real INSERT rather than reading the entire
+already-accumulated dataset into memory, concatenating, and rewriting it —
+that read-modify-write pattern was the cause of severe memory pressure once
+the staging data grew into the multiple-GB range.
 
 Does NOT touch crypto (already ~100% complete via Binance) or the daily
 incremental Alpaca pull in extraction/ohlcv.py — this only rebuilds
 equity/ETF *history*. Promote the result into data/ohlcv_1min.parquet with
 `python -m extraction.ohlcv_massive --promote` once the backfill finishes.
-
 """
 
 import argparse
@@ -20,6 +26,7 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -32,11 +39,12 @@ load_dotenv()
 MASSIVE_API_BASE = 'https://api.massive.com'
 MASSIVE_RATE_LIMIT_CALLS_PER_MIN = 5  # free tier
 MASSIVE_MAX_BARS_PER_CALL = 50_000
-STAGING_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_1min_massive.parquet'
+DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv.duckdb'
+STAGING_TABLE = 'massive_1min'
 PROGRESS_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_massive_progress.json'
 DEFAULT_START = date(2024, 7, 23)
 DEFAULT_END = date(2026, 7, 23)
-CHECKPOINT_EVERY = 25  # tickers per flush to the staging parquet
+CHECKPOINT_EVERY = 25  # tickers per flush to the DuckDB staging table
 
 
 class _RateLimiter:
@@ -116,6 +124,24 @@ def _save_progress(progress: dict) -> None:
     PROGRESS_PATH.write_text(json.dumps(progress, indent=2, default=str))
 
 
+def _connect() -> duckdb.DuckDBPyConnection:
+    DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(DUCKDB_PATH))
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {STAGING_TABLE} (
+            datetime TIMESTAMPTZ NOT NULL,
+            ticker   VARCHAR NOT NULL,
+            open     DOUBLE,
+            high     DOUBLE,
+            low      DOUBLE,
+            close    DOUBLE,
+            volume   DOUBLE
+        )
+    """)
+    con.execute(f'CREATE INDEX IF NOT EXISTS idx_{STAGING_TABLE}_ticker ON {STAGING_TABLE}(ticker)')
+    return con
+
+
 def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_START, end: date = DEFAULT_END,
                          force: bool = False, checkpoint_every: int = CHECKPOINT_EVERY) -> None:
     """
@@ -133,6 +159,7 @@ def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_
     remaining = [t for t in tickers if force or progress.get(t, {}).get('status') != 'done']
     print(f'{len(tickers) - len(remaining)}/{len(tickers)} already done, {len(remaining)} remaining')
 
+    con = _connect()
     limiter = _RateLimiter(MASSIVE_RATE_LIMIT_CALLS_PER_MIN)
     pending_frames: list[pd.DataFrame] = []
     pending_tickers: list[str] = []
@@ -143,24 +170,22 @@ def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_
             return
         non_empty = [f for f in pending_frames if len(f)]
         if non_empty:
-            new_data = pd.concat(non_empty)
-            if STAGING_PATH.exists():
-                existing = pd.read_parquet(STAGING_PATH)
-                combined = pd.concat([existing, new_data])
-                combined = combined[~combined.index.duplicated(keep='last')]
-            else:
-                combined = new_data
-            combined.sort_index(inplace=True)
-            STAGING_PATH.parent.mkdir(parents=True, exist_ok=True)
-            combined.to_parquet(STAGING_PATH)
-            n_rows = len(combined)
-        else:
-            n_rows = len(pd.read_parquet(STAGING_PATH)) if STAGING_PATH.exists() else 0
+            new_data = pd.concat(non_empty).reset_index()
+            data_tickers = new_data['ticker'].unique().tolist()
+            # Delete-then-insert only the tickers with actual new rows, so a
+            # re-run (or --force) never duplicates a ticker's rows — no read
+            # of existing data required, unlike the old parquet flush.
+            placeholders = ', '.join('?' * len(data_tickers))
+            con.execute(f'DELETE FROM {STAGING_TABLE} WHERE ticker IN ({placeholders})', data_tickers)
+            con.register('_new_data', new_data)
+            con.execute(f'INSERT INTO {STAGING_TABLE} SELECT * FROM _new_data')
+            con.unregister('_new_data')
+        n_rows = con.execute(f'SELECT COUNT(*) FROM {STAGING_TABLE}').fetchone()[0]
         # Persist progress only after any new data is safely on disk, so a
         # crash between flush and progress-save can't mark a ticker 'done'
         # for data that isn't actually there.
         _save_progress(progress)
-        print(f'  checkpoint: {len(pending_tickers)} tickers flushed, {n_rows:,} rows in staging file')
+        print(f'  checkpoint: {len(pending_tickers)} tickers flushed, {n_rows:,} rows in {DUCKDB_PATH.name}::{STAGING_TABLE}')
         pending_frames = []
         pending_tickers = []
 
@@ -195,6 +220,8 @@ def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_
         if len(pending_tickers) >= checkpoint_every or i == len(remaining):
             _flush()
 
+    con.close()
+
     n_done = sum(1 for v in progress.values() if v['status'] == 'done')
     n_not_found = sum(1 for v in progress.values() if v['status'] == 'not_found')
     n_error = sum(1 for v in progress.values() if v['status'] == 'error')
@@ -205,12 +232,18 @@ def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_
 def promote_to_main() -> None:
     """
     Backs up the current OHLCV_PATH, then replaces its equities/ETF rows with
-    STAGING_PATH's contents while preserving its crypto rows (still
-    Binance-sourced, untouched).
+    the DuckDB staging table's contents while preserving its crypto rows
+    (still Binance-sourced, untouched).
     """
-    if not STAGING_PATH.exists():
-        raise FileNotFoundError(f'{STAGING_PATH} not found — run build_massive_ohlcv() first')
-    massive_df = pd.read_parquet(STAGING_PATH)
+    if not DUCKDB_PATH.exists():
+        raise FileNotFoundError(f'{DUCKDB_PATH} not found — run build_massive_ohlcv() first')
+
+    con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+    massive_df = con.execute(f'SELECT * FROM {STAGING_TABLE}').df()
+    con.close()
+    if massive_df.empty:
+        raise ValueError(f'{STAGING_TABLE} is empty — run build_massive_ohlcv() first')
+    massive_df = massive_df.set_index(['datetime', 'ticker'])[OHLCV_COLS].sort_index()
 
     if OHLCV_PATH.exists():
         backup_path = OHLCV_PATH.with_name(
@@ -237,7 +270,7 @@ if __name__ == '__main__':
     p.add_argument('--end', type=date.fromisoformat, default=DEFAULT_END)
     p.add_argument('--force', action='store_true', help='Re-fetch tickers already marked done.')
     p.add_argument('--promote', action='store_true',
-                    help='Skip fetching; just promote the existing staging file into ohlcv_1min.parquet.')
+                    help='Skip fetching; just promote the existing DuckDB staging table into ohlcv_1min.parquet.')
     args = p.parse_args()
 
     if args.promote:
