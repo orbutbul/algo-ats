@@ -24,6 +24,7 @@ import base64
 import os
 import re
 import requests
+import duckdb
 import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
@@ -597,125 +598,163 @@ def dump_widget_text(post_url: str | None = None, out_path: str = "widget_text_d
 # Daily persistence
 # ---------------------------------------------------------------------------
 
-WSB_DIR = Path("data/wsb")
+WSB_DB_PATH = Path("data/wsb.duckdb")
 
-_FILES = {
-    "sentiment":           WSB_DIR / "sentiment.parquet",
-    "sentiment_most_bearish": WSB_DIR / "sentiment_most_bearish.parquet",
-    "sentiment_most_bullish": WSB_DIR / "sentiment_most_bullish.parquet",
-    "top_holdings":        WSB_DIR / "top_holdings.parquet",
-    "top_trades":          WSB_DIR / "top_trades.parquet",
-    "biggest_movers":      WSB_DIR / "biggest_movers.parquet",
-    "mentions":            WSB_DIR / "mentions.parquet",
-    "leaderboard":         WSB_DIR / "leaderboard.parquet",
-    "leaderboard_streaks": WSB_DIR / "leaderboard_streaks.parquet",
+_TABLES = {
+    "sentiment": {
+        "schema": "date DATE, hour INTEGER, bearish_pct DOUBLE, bullish_pct DOUBLE",
+        "dedup_cols": ["date", "hour"],
+    },
+    "sentiment_most_bearish": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, split VARCHAR, pct DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "sentiment_most_bullish": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, split VARCHAR, pct DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "top_holdings": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, price DOUBLE, change_pct DOUBLE, count DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "top_trades": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, contract VARCHAR, qty DOUBLE, pnl DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "biggest_movers": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, price DOUBLE, change_pct DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "mentions": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, price DOUBLE, change_pct DOUBLE, count DOUBLE",
+        "dedup_cols": ["date", "hour", "ticker"],
+    },
+    "leaderboard": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, username VARCHAR, count DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
+    "leaderboard_streaks": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, username VARCHAR, streak_days DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
 }
+
+
+def _connect_wsb_db(read_only: bool = False) -> "duckdb.DuckDBPyConnection":
+    WSB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(WSB_DB_PATH), read_only=read_only)
+    if not read_only:
+        for name, spec in _TABLES.items():
+            con.execute(f"CREATE TABLE IF NOT EXISTS {name} ({spec['schema']})")
+    return con
+
+
+def _upsert(con: "duckdb.DuckDBPyConnection", table: str, df: pd.DataFrame) -> None:
+    """
+    Delete any existing rows matching this batch's dedup key, then insert —
+    safe to call multiple times for the same (date, hour): the later call's
+    rows replace the earlier ones rather than duplicating them.
+    """
+    if df.empty:
+        return
+    dedup_cols = _TABLES[table]["dedup_cols"]
+    key_cols = ", ".join(dedup_cols)
+    con.register("_new", df)
+    con.execute(f"DELETE FROM {table} WHERE ({key_cols}) IN (SELECT {key_cols} FROM _new)")
+    con.execute(f"INSERT INTO {table} SELECT * FROM _new")
+    con.unregister("_new")
 
 
 def save_wsb_data(data: dict) -> None:
     """
-    Append this run's WSB snapshot to the parquet files in data/wsb/, tagged
-    with the UTC hour it was captured in. Safe to call multiple times within
-    the same hour — existing rows for that (date, hour) are replaced; calls
-    in different hours of the same day both accumulate, building an intraday
-    history rather than overwriting the day's only snapshot.
+    Append this run's WSB snapshot to data/wsb.duckdb (one table per section),
+    tagged with the UTC hour it was captured in. Safe to call multiple times
+    within the same hour — existing rows for that (date, hour) are replaced;
+    calls in different hours of the same day both accumulate, building an
+    intraday history rather than overwriting the day's only snapshot.
     """
-    WSB_DIR.mkdir(parents=True, exist_ok=True)
-
     now = datetime.now(timezone.utc)
     date = now.date()
     hour = now.hour
 
-    # --- sentiment (one row per hour: both directions' overall score) ---
-    sent = data.get("sentiment", {})
-    sent_row = {
-        "date": date,
-        "hour": hour,
-        "bearish_pct": sent.get("bearish_pct"),
-        "bullish_pct": sent.get("bullish_pct"),
-    }
-    _append(pd.DataFrame([sent_row]), _FILES["sentiment"], dedup_cols=["date", "hour"])
+    con = _connect_wsb_db()
+    try:
+        # --- sentiment (one row per hour: both directions' overall score) ---
+        sent = data.get("sentiment", {})
+        sent_row = {
+            "date": date,
+            "hour": hour,
+            "bearish_pct": sent.get("bearish_pct"),
+            "bullish_pct": sent.get("bullish_pct"),
+        }
+        _upsert(con, "sentiment", pd.DataFrame([sent_row]))
 
-    for direction in ("most_bearish", "most_bullish"):
+        for direction in ("most_bearish", "most_bullish"):
+            rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+                    for i, r in enumerate(sent.get(direction, []))]
+            _upsert(con, f"sentiment_{direction}", pd.DataFrame(rows))
+
+        # --- top_holdings ---
         rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-                for i, r in enumerate(sent.get(direction, []))]
-        if rows:
-            _append(pd.DataFrame(rows), _FILES[f"sentiment_{direction}"], dedup_cols=["date", "hour", "rank"])
+                for i, r in enumerate(data.get("top_holdings", []))]
+        _upsert(con, "top_holdings", pd.DataFrame(rows))
 
-    # --- top_holdings ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-            for i, r in enumerate(data.get("top_holdings", []))]
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["top_holdings"], dedup_cols=["date", "hour", "rank"])
+        # --- top_trades ---
+        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+                for i, r in enumerate(data.get("top_trades", []))]
+        _upsert(con, "top_trades", pd.DataFrame(rows))
 
-    # --- top_trades ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-            for i, r in enumerate(data.get("top_trades", []))]
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["top_trades"], dedup_cols=["date", "hour", "rank"])
+        # --- biggest_movers ---
+        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+                for i, r in enumerate(data.get("biggest_movers", []))]
+        _upsert(con, "biggest_movers", pd.DataFrame(rows))
 
-    # --- biggest_movers ---
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-            for i, r in enumerate(data.get("biggest_movers", []))]
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["biggest_movers"], dedup_cols=["date", "hour", "rank"])
+        # --- mentions ---
+        rows = []
+        for i, m in enumerate(data.get("mentions", [])):
+            ticker = m.get("ticker", "")
+            if ticker:
+                rows.append({"date": date, "hour": hour, "rank": i + 1, "ticker": ticker,
+                             "price": m.get("price"), "change_pct": m.get("change_pct"),
+                             "count": m.get("count")})
+        _upsert(con, "mentions", pd.DataFrame(rows))
 
-    # --- mentions ---
-    rows = []
-    for i, m in enumerate(data.get("mentions", [])):
-        ticker = m.get("ticker", "")
-        if ticker:
-            rows.append({"date": date, "hour": hour, "rank": i + 1, "ticker": ticker,
-                         "price": m.get("price"), "change_pct": m.get("change_pct"),
-                         "count": m.get("count")})
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["mentions"], dedup_cols=["date", "hour", "ticker"])
+        # --- leaderboard (by comments, and by streak length) ---
+        lb = data.get("leaderboard", {})
+        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+                for i, r in enumerate(lb.get("by_comments", []))]
+        _upsert(con, "leaderboard", pd.DataFrame(rows))
 
-    # --- leaderboard (by comments, and by streak length) ---
-    lb = data.get("leaderboard", {})
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-            for i, r in enumerate(lb.get("by_comments", []))]
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard"], dedup_cols=["date", "hour", "rank"])
+        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
+                for i, r in enumerate(lb.get("by_streak", []))]
+        _upsert(con, "leaderboard_streaks", pd.DataFrame(rows))
+    finally:
+        con.close()
 
-    rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-            for i, r in enumerate(lb.get("by_streak", []))]
-    if rows:
-        _append(pd.DataFrame(rows), _FILES["leaderboard_streaks"], dedup_cols=["date", "hour", "rank"])
-
-    print(f"Saved WSB data for {date} {hour:02d}:00 UTC -> {WSB_DIR}/")
-
-
-def _append(new_df: pd.DataFrame, path: Path, dedup_cols: list[str]) -> None:
-    if new_df.empty:
-        return
-    if path.exists():
-        existing = pd.read_parquet(path)
-        mask = existing[dedup_cols[0]].astype(str).isin(new_df[dedup_cols[0]].astype(str))
-        for col in dedup_cols[1:]:
-            mask &= existing[col].astype(str).isin(new_df[col].astype(str))
-        existing = existing[~mask]
-        combined = pd.concat([existing, new_df], ignore_index=True)
-    else:
-        combined = new_df
-    combined.to_parquet(path, index=False)
+    print(f"Saved WSB data for {date} {hour:02d}:00 UTC -> {WSB_DB_PATH}")
 
 
 def load_wsb_data(table: str, date_from: str | None = None) -> pd.DataFrame:
     """
-    Read a stored WSB table.
+    Read a stored WSB table from data/wsb.duckdb.
 
     table: 'sentiment' | 'sentiment_most_bearish' | 'sentiment_most_bullish'
          | 'top_holdings' | 'top_trades' | 'biggest_movers' | 'mentions'
          | 'leaderboard' | 'leaderboard_streaks'
     date_from: optional ISO date string, e.g. '2026-05-01'
     """
-    path = _FILES.get(table)
-    if path is None:
-        raise ValueError(f"Unknown table '{table}'. Choose from: {list(_FILES)}")
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found — run save_wsb_data() first")
-    df = pd.read_parquet(path)
-    if date_from:
-        df = df[pd.to_datetime(df["date"]) >= pd.Timestamp(date_from)]
-    return df
+    if table not in _TABLES:
+        raise ValueError(f"Unknown table '{table}'. Choose from: {list(_TABLES)}")
+    if not WSB_DB_PATH.exists():
+        raise FileNotFoundError(f"{WSB_DB_PATH} not found — run save_wsb_data() first")
+
+    con = _connect_wsb_db(read_only=True)
+    try:
+        query = f"SELECT * FROM {table}"
+        params = []
+        if date_from:
+            query += " WHERE date >= ?"
+            params.append(date_from)
+        return con.execute(query, params).df()
+    finally:
+        con.close()
