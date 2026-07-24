@@ -7,10 +7,19 @@ Runs:
 """
 
 import logging
+import os
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+# When launched via pythonw.exe (no console, so nothing pops up on screen),
+# sys.stdout/stderr are None — bare print()s and the StreamHandler below
+# would crash on the first write. Give them a harmless sink instead.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
 
 from extraction.wsb import get_latest_wsb_data, save_wsb_data
 
