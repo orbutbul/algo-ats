@@ -414,46 +414,54 @@ def _list_posts_oauth(token: str, limit: int) -> list[dict]:
 
 def _list_posts_playwright(limit: int) -> list[dict]:
     """
-    Find 'What Are Your Moves' posts on r/wallstreetbets via old.reddit.com.
-    old Reddit is server-rendered HTML so selectors are stable.
-    Returns www.reddit.com URLs so the widget can be rendered directly.
+    List u/verified-trader's own recent posts via their public profile page
+    on www.reddit.com (new Reddit).
+
+    old.reddit.com now redirects logged-out visitors to a login wall for
+    r/wallstreetbets (Reddit policy change), and Reddit closed self-serve
+    OAuth app registration in 2026 (the "Responsible Builder Policy" — new
+    apps now require prior approval), so this profile page is the only
+    unauthenticated path left. www.reddit.com's <shreddit-post> custom
+    elements expose title/permalink/timestamp as plain HTML attributes (no
+    shadow-DOM piercing needed) — but the list is virtualized, so posts
+    scrolled far out of view get unmounted from the DOM. Collected
+    incrementally across scroll steps rather than read once at the end.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        page.goto("https://old.reddit.com/r/wallstreetbets/", wait_until="domcontentloaded", timeout=45_000)
+        page.goto(f"https://www.reddit.com/user/{REDDIT_USER}/submitted/", wait_until="load", timeout=45_000)
+        page.wait_for_timeout(3_000)
 
-        collected = []
-        for thing in page.query_selector_all("div.thing[data-fullname]"):
-            title_el = thing.query_selector("a.title")
-            if not title_el:
-                continue
-            title = title_el.inner_text().strip()
-            if "what are your moves" not in title.lower():
-                continue
+        collected: dict[str, dict] = {}  # permalink -> post, insertion order preserved
+        stall_rounds = 0
+        while len(collected) < limit and stall_rounds < 3:
+            before = len(collected)
+            for post in page.query_selector_all("shreddit-post"):
+                permalink = post.get_attribute("permalink") or ""
+                if not permalink or permalink in collected:
+                    continue
+                title = post.get_attribute("post-title") or ""
+                ts = post.get_attribute("created-timestamp")
+                created = datetime.fromisoformat(ts) if ts else datetime.now(tz=timezone.utc)
+                post_id = permalink.rstrip("/").split("/")[-2] if "/comments/" in permalink else permalink
+                collected[permalink] = {
+                    "id": post_id, "title": title,
+                    "url": f"https://www.reddit.com{permalink}", "created_utc": created,
+                }
 
-            href    = title_el.get_attribute("href") or ""
-            ts      = thing.get_attribute("data-timestamp")
-            post_id = (thing.get_attribute("data-fullname") or "")[3:]
-
-            full_url = href.replace("old.reddit.com", "www.reddit.com")
-            if full_url.startswith("/"):
-                full_url = f"https://www.reddit.com{full_url}"
-
-            created = (datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-                       if ts else datetime.now(tz=timezone.utc))
-            collected.append({"id": post_id, "title": title, "url": full_url, "created_utc": created})
-            if len(collected) >= limit:
-                break
+            stall_rounds = 0 if len(collected) > before else stall_rounds + 1
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1_000)
 
         browser.close()
 
-    return collected
+    return list(collected.values())[:limit]
 
 
 def _parse_listing_json(data: dict) -> list[dict]:
@@ -515,9 +523,20 @@ def get_latest_wsb_data(
             f"Available titles:\n  {available}"
         )
 
-    data = fetch_wsb_post(matching[0]["url"])
-    data["post_title"] = matching[0]["title"]
-    data["post_date"]  = matching[0]["created_utc"]
+    target = matching[0]
+    if posts[0]["id"] != target["id"]:
+        # The widget only renders live data on the single most-recent post
+        # from the account, regardless of thread type — any older post
+        # (even the latest 'moves' thread, if a newer 'daily' thread has
+        # since been posted) shows a "this is not the most recent thread"
+        # banner instead of data. The widget's content (sentiment/holdings/
+        # trades/mentions) is account-wide, not specific to any one thread's
+        # topic, so falling back to the true latest post is safe.
+        target = posts[0]
+
+    data = fetch_wsb_post(target["url"])
+    data["post_title"] = target["title"]
+    data["post_date"]  = target["created_utc"]
 
     if as_df:
         return pd.DataFrame(data["biggest_movers"])
