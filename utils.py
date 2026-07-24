@@ -43,6 +43,74 @@ def get_data(tickers=None, start=None, end=None):
     }
 
 
+def get_data_duckdb(tickers=None, start=None, end=None):
+    """
+    Same shape and params as get_data(), but sourced from
+    data/ohlcv.duckdb::massive_1min (the Massive equities/ETF backfill —
+    NOT the full ohlcv_1min.parquet universe; crypto isn't in this table)
+    instead of a parquet file. Filters are pushed down into SQL rather than
+    applied in pandas after loading, so this never reads the whole table
+    into memory — only the matching rows come across.
+
+    Opens a fresh read-only connection per call rather than holding one
+    open, since data/ohlcv.duckdb is a single-writer file: the Massive
+    backfill (extraction/ohlcv_massive.py) holds an exclusive read-write
+    connection for hours at a time while running, and DuckDB does not allow
+    even a read-only connection to open concurrently with it (verified: it
+    raises duckdb.IOException, not a silent/partial read). Callers should
+    expect this to raise while a backfill is actively running and simply
+    retry later — see the raised error message.
+    """
+    import duckdb
+    tickers = [tickers] if isinstance(tickers, str) else tickers
+
+    def _to_utc_ts(x):
+        # datetime is stored as TIMESTAMPTZ — a naive Timestamp param compares
+        # incorrectly against it (silently matches nothing), so always localize
+        # or convert to UTC before binding.
+        ts = pd.Timestamp(x)
+        return ts.tz_localize('UTC') if ts.tzinfo is None else ts.tz_convert('UTC')
+
+    where = []
+    params = []
+    if tickers is not None:
+        placeholders = ', '.join('?' * len(tickers))
+        where.append(f'ticker IN ({placeholders})')
+        params.extend(tickers)
+    if start is not None:
+        where.append('datetime >= ?')
+        params.append(_to_utc_ts(start))
+    if end is not None:
+        where.append('datetime <= ?')
+        params.append(_to_utc_ts(end))
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ''
+
+    query = f'SELECT * FROM massive_1min {where_clause} ORDER BY datetime'
+
+    try:
+        con = duckdb.connect(str(Path(__file__).parent / 'data' / 'ohlcv.duckdb'), read_only=True)
+    except duckdb.IOException as e:
+        raise RuntimeError(
+            'Could not open data/ohlcv.duckdb read-only — it is likely locked by a '
+            'currently-running Massive backfill (extraction/ohlcv_massive.py), which '
+            'holds an exclusive read-write connection while fetching. Wait for it to '
+            'finish (or pause it) and try again.'
+        ) from e
+
+    try:
+        df = con.execute(query, params).df()
+    finally:
+        con.close()
+
+    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+    df = df.set_index(['datetime', 'ticker'])
+
+    return {
+        ticker: group.droplevel('ticker').rename(columns=str.title)
+        for ticker, group in df.groupby(level='ticker')
+    }
+
+
 
 def _tracked_symbols() -> dict:
     """
