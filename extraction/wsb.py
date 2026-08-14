@@ -128,10 +128,22 @@ def _click_sentiment_toggle(frame: Frame) -> bool:
 def _capture_widget_views(post_url: str) -> dict[str, str]:
     """
     Render a verified-trader post and capture the Devvit widget's plain
-    visible text under three tab states — no login required:
-      - "base":            default state (Comments leaderboard, one sentiment direction)
-      - "leaderboard_alt":  Leaderboard switched to its Streaks tab
-      - "sentiment_alt":    Sentiment switched to its inverse (Bull<->Bear) direction
+    visible text under several tab states — no login required:
+      - "base":            default landing state (usually the Chat tab)
+      - "leaderboard_alt":  Leaderboard switched to its Streaks tab (legacy;
+                            no longer reachable post-redesign, kept as a
+                            harmless no-op in case Reddit reverts)
+      - "sentiment_alt":    legacy Sentiment Bull/Bear toggle (same as above)
+      - "portfolio":        Data tab, default Portfolio sub-tab (open positions
+                            + trader/exposure summary)
+      - "mentions_v2":      Data tab, Sentiment sub-tab (ticker mentions list)
+
+    As of the 2026-08 widget redesign, the old flat MENTIONS 24H / SENTIMENT /
+    LEADERBOARD / TOP HOLDINGS / TOP TRADES section layout is gone, replaced
+    by tabs (Me / Data / Casino / Chat) with Data itself split into
+    Portfolio / Sentiment / BanBets sub-tabs. "base" is kept for the legacy
+    parsers (now mostly dead) but "portfolio" and "mentions_v2" are the
+    views that actually carry current data.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -172,6 +184,15 @@ def _capture_widget_views(post_url: str) -> dict[str, str]:
                 views["sentiment_alt"] = frame.inner_text("body")
             else:
                 views["sentiment_alt"] = ""
+
+            views["portfolio"] = ""
+            views["mentions_v2"] = ""
+            if _click_visible_text(frame, "Data"):
+                page.wait_for_timeout(1_500)
+                views["portfolio"] = frame.inner_text("body")
+                if _click_visible_text(frame, "Sentiment"):
+                    page.wait_for_timeout(1_500)
+                    views["mentions_v2"] = frame.inner_text("body")
 
             return views
         finally:
@@ -356,18 +377,94 @@ def _parse_top_trades(lines: list[str]) -> list[dict]:
     return out
 
 
+_PAGINATION_RE = re.compile(r"^[\d,]+[–-][\d,]+ of [\d,]+$")
+
+
+def _rows_after_marker(lines: list[str], marker: str, cols: int) -> list[list[str]]:
+    """
+    Find the last occurrence of `marker` (a column header) in `lines`, then
+    consume everything after it in groups of `cols`, skipping the trailing
+    pagination footer line (e.g. "1–19 of 200") if present.
+    """
+    try:
+        start = len(lines) - 1 - lines[::-1].index(marker)
+    except ValueError:
+        return []
+    data = [ln for ln in lines[start + 1:] if not _PAGINATION_RE.match(ln)]
+    return [data[i:i + cols] for i in range(0, len(data) - cols + 1, cols)]
+
+
+def _parse_positions(lines: list[str]) -> list[dict]:
+    """
+    Parse the Data > Portfolio sub-tab's open-positions table (post-2026-08
+    widget redesign). Row shape: rank, "TICKER $STRIKE", C/P, expiry, DTE,
+    holders, qty, value, sentiment %, delta.
+    """
+    out = []
+    for i, group in enumerate(_rows_after_marker(lines, "Δ", cols=10)):
+        rank, contract, opt_type, expiry, dte, holders, qty, val, sent_pct, delta = group
+        parts = contract.split(maxsplit=1)
+        out.append({
+            "rank": _num(rank) or (i + 1),
+            "ticker": parts[0],
+            "strike": _num(parts[1]) if len(parts) > 1 else None,
+            "contract_type": opt_type,
+            "expiry": expiry,
+            "dte": _num(dte.rstrip("dD")),
+            "holders": _num(holders),
+            "qty": _num(qty),
+            "val": _num(val),
+            "sent_pct": _num(sent_pct),
+            "delta": None if delta.strip() == "—" else _num(delta),
+        })
+    return out
+
+
+def _parse_mentions_v2(lines: list[str]) -> list[dict]:
+    """
+    Parse the Data > Sentiment sub-tab's Ticker List (post-2026-08 widget
+    redesign). Row shape: rank, ticker, holders, bull %, mentions, score.
+    """
+    out = []
+    for i, group in enumerate(_rows_after_marker(lines, "Score", cols=6)):
+        rank, ticker, holders, bull_pct, mentions, score = group
+        out.append({
+            "rank": _num(rank) or (i + 1),
+            "ticker": ticker,
+            "holders": _num(holders),
+            "bull_pct": _num(bull_pct),
+            "mentions": _num(mentions),
+            "score": _num(score),
+        })
+    return out
+
+
+def _parse_portfolio_summary(lines: list[str]) -> dict:
+    """Overall trader sentiment card at the top of Data > Portfolio: 'NN% BULLISH'."""
+    try:
+        idx = lines.index("BULLISH")
+    except ValueError:
+        return {"bullish_pct": None}
+    return {"bullish_pct": _num(lines[idx - 1]) if idx > 0 else None}
+
+
 def _extract_wsb_data(views: dict[str, str]) -> dict:
     """
-    views: {"base": str, "leaderboard_alt": str, "sentiment_alt": str} as
-    produced by _capture_widget_views (a bare str is also accepted for
-    backward-compat / ad-hoc use, treated as the base-only view).
+    views: {"base": str, "leaderboard_alt": str, "sentiment_alt": str,
+    "portfolio": str, "mentions_v2": str} as produced by
+    _capture_widget_views (a bare str is also accepted for backward-compat /
+    ad-hoc use, treated as the base-only view).
     """
     if isinstance(views, str):
-        views = {"base": views, "leaderboard_alt": "", "sentiment_alt": ""}
+        views = {"base": views, "leaderboard_alt": "", "sentiment_alt": "",
+                  "portfolio": "", "mentions_v2": ""}
 
     sections = _split_sections(views["base"])
     alt_leaderboard_sections = _split_sections(views.get("leaderboard_alt", "") or "")
     alt_sentiment_sections = _split_sections(views.get("sentiment_alt", "") or "")
+
+    portfolio_lines = [ln.strip() for ln in views.get("portfolio", "").splitlines() if ln.strip()]
+    mentions_v2_lines = [ln.strip() for ln in views.get("mentions_v2", "").splitlines() if ln.strip()]
 
     return {
         "biggest_movers": _parse_biggest_movers(sections.get("ticker_strip", [])),
@@ -382,6 +479,9 @@ def _extract_wsb_data(views: dict[str, str]) -> dict:
         },
         "top_holdings":   _parse_ticker_groups(sections.get("TOP HOLDINGS", []), cols=4),
         "top_trades":     _parse_top_trades(sections.get("TOP TRADES", [])),
+        "positions_v2":   _parse_positions(portfolio_lines),
+        "mentions_v2":    _parse_mentions_v2(mentions_v2_lines),
+        "portfolio_summary": _parse_portfolio_summary(portfolio_lines),
     }
 
 
@@ -637,6 +737,18 @@ _TABLES = {
         "schema": "date DATE, hour INTEGER, rank INTEGER, username VARCHAR, streak_days DOUBLE",
         "dedup_cols": ["date", "hour", "rank"],
     },
+    # --- post-2026-08 widget redesign (Data > Portfolio / Data > Sentiment) ---
+    "mentions_v2": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, holders DOUBLE, "
+                  "bull_pct DOUBLE, mentions DOUBLE, score DOUBLE",
+        "dedup_cols": ["date", "hour", "ticker"],
+    },
+    "positions_v2": {
+        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, strike DOUBLE, "
+                  "contract_type VARCHAR, expiry VARCHAR, dte DOUBLE, holders DOUBLE, "
+                  "qty DOUBLE, val DOUBLE, sent_pct DOUBLE, delta DOUBLE",
+        "dedup_cols": ["date", "hour", "rank"],
+    },
 }
 
 
@@ -680,14 +792,23 @@ def save_wsb_data(data: dict) -> None:
     con = _connect_wsb_db()
     try:
         # --- sentiment (one row per hour: both directions' overall score) ---
+        # The legacy Bull/Bear-toggle section this used to come from no longer
+        # exists (2026-08 widget redesign); fall back to the Portfolio tab's
+        # single "NN% BULLISH" summary card. Skip the row entirely rather than
+        # write an all-null placeholder if neither source has a value.
         sent = data.get("sentiment", {})
-        sent_row = {
-            "date": date,
-            "hour": hour,
-            "bearish_pct": sent.get("bearish_pct"),
-            "bullish_pct": sent.get("bullish_pct"),
-        }
-        _upsert(con, "sentiment", pd.DataFrame([sent_row]))
+        bullish_pct = sent.get("bullish_pct")
+        if bullish_pct is None:
+            bullish_pct = data.get("portfolio_summary", {}).get("bullish_pct")
+        bearish_pct = sent.get("bearish_pct")
+        if bullish_pct is not None or bearish_pct is not None:
+            sent_row = {
+                "date": date,
+                "hour": hour,
+                "bearish_pct": bearish_pct,
+                "bullish_pct": bullish_pct,
+            }
+            _upsert(con, "sentiment", pd.DataFrame([sent_row]))
 
         for direction in ("most_bearish", "most_bullish"):
             rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
@@ -705,8 +826,12 @@ def save_wsb_data(data: dict) -> None:
         _upsert(con, "top_trades", pd.DataFrame(rows))
 
         # --- biggest_movers ---
+        # The ticker-strip this parses no longer reliably exists post-redesign;
+        # only keep rows that actually resolved a price, to avoid writing
+        # tickers with all-null price/change_pct.
         rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-                for i, r in enumerate(data.get("biggest_movers", []))]
+                for i, r in enumerate(data.get("biggest_movers", []))
+                if r.get("price") is not None]
         _upsert(con, "biggest_movers", pd.DataFrame(rows))
 
         # --- mentions ---
@@ -728,6 +853,14 @@ def save_wsb_data(data: dict) -> None:
         rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
                 for i, r in enumerate(lb.get("by_streak", []))]
         _upsert(con, "leaderboard_streaks", pd.DataFrame(rows))
+
+        # --- mentions_v2 (Data > Sentiment ticker list) ---
+        rows = [{"date": date, "hour": hour, **r} for r in data.get("mentions_v2", [])]
+        _upsert(con, "mentions_v2", pd.DataFrame(rows))
+
+        # --- positions_v2 (Data > Portfolio open positions) ---
+        rows = [{"date": date, "hour": hour, **r} for r in data.get("positions_v2", [])]
+        _upsert(con, "positions_v2", pd.DataFrame(rows))
     finally:
         con.close()
 
