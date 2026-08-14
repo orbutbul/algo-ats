@@ -43,7 +43,47 @@ def get_data(tickers=None, start=None, end=None):
     }
 
 
-def get_data_duckdb(tickers=None, start=None, end=None):
+_DUCKDB_FREQ_ALIASES = {
+    'hourly': 'h',
+    'daily': 'D',
+    'weekly': 'W',
+    'monthly': 'ME',
+}
+
+# Bucket expressions for pushing freq resampling into SQL instead of pulling raw
+# 1-min rows and resampling in pandas — see get_data_duckdb's SQL-pushdown branch.
+# Only covers the 4 canonical freq names above (not arbitrary pandas offset
+# aliases like '15min'), matched to pandas' own bin-label convention so the
+# pushdown path and the pandas-resample path agree: 'hourly'/'daily' both label
+# at bin start; 'weekly' matches pandas' default W-SUN (label = the bin's
+# Sunday); 'monthly' matches 'ME' (label = month end).
+#
+# `datetime AT TIME ZONE 'UTC'` is required before date_trunc: this connection's
+# session TimeZone is America/New_York (verified via current_setting('TimeZone')),
+# and date_trunc on a TIMESTAMPTZ truncates in the *session* timezone, not UTC —
+# for 'day'/'week'/'month' buckets (not whole-hour multiples of the NY/UTC
+# offset) that silently shifts bucket boundaries by the UTC offset (verified:
+# without this, daily buckets landed on 04:00 UTC instead of 00:00 UTC, 4hrs off
+# from the pandas-resample path's labels). 'hourly' is unaffected in practice
+# (a whole-hour offset commutes with hour-truncation) but included for
+# consistency/robustness to a future non-whole-hour session timezone.
+_DUCKDB_BUCKET_SQL = {
+    'hourly': "date_trunc('hour', datetime AT TIME ZONE 'UTC')",
+    'daily': "date_trunc('day', datetime AT TIME ZONE 'UTC')",
+    'weekly': "date_trunc('week', datetime AT TIME ZONE 'UTC') + INTERVAL 6 DAY",
+    'monthly': "date_trunc('month', datetime AT TIME ZONE 'UTC') + INTERVAL 1 MONTH - INTERVAL 1 DAY",
+}
+
+# Above this many tickers (or no ticker filter at all), pulling raw 1-min rows
+# and resampling in pandas is not just slow but can exhaust memory (verified:
+# a full 2,314-ticker daily pull over ~9 months tried to materialize ~155M raw
+# rows and raised MemoryError). SQL-side aggregation does the same pull in
+# single-digit seconds. Ticker-filtered calls below this threshold keep using
+# the existing pandas-resample path, which is already fast and well-exercised.
+_DUCKDB_SQL_PUSHDOWN_TICKER_THRESHOLD = 300
+
+
+def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, asvbt=False):
     """
     Same shape and params as get_data(), but sourced from
     data/ohlcv.duckdb::massive_1min (the Massive equities/ETF backfill —
@@ -60,7 +100,36 @@ def get_data_duckdb(tickers=None, start=None, end=None):
     raises duckdb.IOException, not a silent/partial read). Callers should
     expect this to raise while a backfill is actively running and simply
     retry later — see the raised error message.
+
+    freq: resample the raw 1-min bars before returning. One of
+    'hourly'/'daily'/'weekly'/'monthly', or any pandas offset alias (e.g. '15min').
+    OHLC is aggregated as first/max/min/last, volume summed, per-ticker so bars
+    never blend across symbols; empty bins (e.g. weekends) are dropped. None
+    (default) returns the raw 1-min bars.
+
+    When freq is one of the 4 named aliases above AND tickers is None or covers
+    more than _DUCKDB_SQL_PUSHDOWN_TICKER_THRESHOLD symbols, the aggregation is
+    pushed down into SQL (GROUP BY a date_trunc bucket) instead of pulling raw
+    1-min rows and resampling in pandas — pulling+resampling a full-universe
+    daily bar set in pandas tries to materialize hundreds of millions of raw
+    rows first and can exhaust memory (verified). Smaller ticker-filtered calls
+    keep using the pandas-resample path, which is already fast. Both paths
+    produce the same bin boundaries for 'hourly'/'daily'; 'weekly'/'monthly' are
+    label-matched to pandas' 'W'/'ME' convention but lower-confidence since nothing
+    in this codebase exercises them at the moment.
+
+    asdf: if True, return a single DataFrame with a (datetime, ticker) MultiIndex
+    instead of a {ticker: DataFrame} dict — convenient for cross-sectional ops
+    (e.g. `.xs(ticker, level='ticker')` or `.loc[:, 'Close'].unstack('ticker')`).
+
+    asvbt: if True, return a `vbt.Data` instance (built via `vbt.Data.from_data`
+    on the {ticker: DataFrame} dict) instead of a plain dict/DataFrame — plugs
+    straight into vbt indicators/portfolios (`data.get('Close')`, `data.hlc3`,
+    `vbt.Portfolio.from_signals(data, ...)`, etc). Mutually exclusive with asdf.
     """
+    if asdf and asvbt:
+        raise ValueError('asdf and asvbt are mutually exclusive — pick one return shape')
+
     import duckdb
     tickers = [tickers] if isinstance(tickers, str) else tickers
 
@@ -85,7 +154,29 @@ def get_data_duckdb(tickers=None, start=None, end=None):
         params.append(_to_utc_ts(end))
     where_clause = f"WHERE {' AND '.join(where)}" if where else ''
 
-    query = f'SELECT * FROM massive_1min {where_clause} ORDER BY datetime'
+    use_sql_pushdown = (
+        freq in _DUCKDB_BUCKET_SQL
+        and (tickers is None or len(tickers) > _DUCKDB_SQL_PUSHDOWN_TICKER_THRESHOLD)
+    )
+
+    if use_sql_pushdown:
+        bucket = _DUCKDB_BUCKET_SQL[freq]
+        query = f'''
+            SELECT
+                ticker,
+                {bucket} AS datetime,
+                arg_min(open, datetime) AS open,
+                max(high) AS high,
+                min(low) AS low,
+                arg_max(close, datetime) AS close,
+                sum(volume) AS volume
+            FROM massive_1min
+            {where_clause}
+            GROUP BY ticker, {bucket}
+            ORDER BY datetime
+        '''
+    else:
+        query = f'SELECT * FROM massive_1min {where_clause} ORDER BY datetime'
 
     try:
         con = duckdb.connect(str(Path(__file__).parent / 'data' / 'ohlcv.duckdb'), read_only=True)
@@ -105,10 +196,26 @@ def get_data_duckdb(tickers=None, start=None, end=None):
     df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
     df = df.set_index(['datetime', 'ticker'])
 
-    return {
+    per_ticker = {
         ticker: group.droplevel('ticker').rename(columns=str.title)
         for ticker, group in df.groupby(level='ticker')
     }
+
+    if freq is not None and not use_sql_pushdown:
+        rule = _DUCKDB_FREQ_ALIASES.get(freq, freq)
+        agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+        per_ticker = {
+            ticker: frame.resample(rule).agg(agg).dropna(subset=['Close'])
+            for ticker, frame in per_ticker.items()
+        }
+
+    if asvbt:
+        return vbt.Data.from_data(per_ticker)
+
+    if not asdf:
+        return per_ticker
+
+    return pd.concat(per_ticker, names=['ticker']).swaplevel().sort_index()
 
 
 
