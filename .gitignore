@@ -33,3 +33,11 @@ agentic/
 
 # Temporary alpaca live executor, for the future
 execution/alpaca_live.py
+
+#in progress
+machine_learning/
+
+screens/
+
+.dockerignore
+airflow/
