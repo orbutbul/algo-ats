@@ -30,6 +30,7 @@ import pandas_market_calendars as mcal
 from utils import screen_symbols
 from extraction.ohlcv import download_daily_1min
 from extraction.fundamentals import fundamentals, FUNDAMENTALS_SPECS
+from validation import validate_screen, validate_ohlcv, validate_fundamentals, send_alert
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,6 +62,7 @@ def run():
     log.info('=' * 55)
 
     errors = []
+    issues = []
 
     # ------------------------------------------------------------------
     # 1. Screen symbols (shared across sections 2 and 3 — section 4 doesn't
@@ -77,6 +79,8 @@ def run():
     except Exception:
         errors.append('symbol screening')
         log.error(traceback.format_exc())
+    else:
+        issues += validate_screen(screen)
 
     # ------------------------------------------------------------------
     # 2. 1-minute OHLCV (only on market days)
@@ -91,6 +95,8 @@ def run():
         except Exception:
             errors.append('1-min OHLCV')
             log.error(traceback.format_exc())
+        else:
+            issues += validate_ohlcv(screen, run_date=start.date())
     else:
         log.info('Not a market day — skipping.')
 
@@ -107,14 +113,23 @@ def run():
         except Exception:
             errors.append('fundamentals')
             log.error(traceback.format_exc())
+        else:
+            issues += validate_fundamentals(screen)
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     elapsed = (datetime.now() - start).seconds
     log.info('=' * 55)
-    if errors:
-        log.warning('Completed with errors in %ds: %s', elapsed, ', '.join(errors))
+    if errors or issues:
+        log.warning('Completed with errors in %ds: %s', elapsed, ', '.join(errors) or 'none')
+        if issues:
+            log.warning('Validation issues: %s', '; '.join(issues))
+        body = (
+            'Hard errors: ' + (', '.join(errors) or 'none')
+            + '\n\nValidation issues:\n' + ('\n'.join(issues) or 'none')
+        )
+        send_alert(f'[ATS] daily_run completed with issues ({start.date()})', body)
     else:
         log.info('All pipelines completed successfully in %ds', elapsed)
     log.info('=' * 55)
