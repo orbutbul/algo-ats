@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pandas_market_calendars as mcal
 
-from utils import OHLCV_PATH, _tracked_symbols
+from utils import OHLCV_DUCKDB_PATH, OHLCV_AIRFLOW_TABLE, _tracked_symbols
 
 GAP_REPORT_PATH = Path(__file__).parent / 'data' / 'gap_report.parquet'
 LOOKBACK_DAYS = 365
@@ -65,15 +65,28 @@ def build_gap_report(df: pd.DataFrame | None = None, tracked: dict | None = None
     excluded — dashboards can distinguish "new listing" from "actually broken"
     via first/last-present-date.
     """
-    if df is None:
-        df = pd.read_parquet(OHLCV_PATH)
-    if tracked is None:
-        tracked = _tracked_symbols()
-
     today = datetime.now(timezone.utc).date()
     cutoff_start = today - pd.Timedelta(days=lookback_days)
     cutoff_start = cutoff_start if isinstance(cutoff_start, date) else cutoff_start.date()
     cutoff_end = today
+
+    if df is None:
+        # Pushed into SQL rather than a full-table pandas read — the table
+        # holds the full history (76M+ rows / ~4GB in memory as of 2026-08),
+        # but this only ever needs the lookback window.
+        import duckdb
+        con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
+        try:
+            df = con.execute(
+                f'SELECT * FROM {OHLCV_AIRFLOW_TABLE} WHERE datetime >= ?',
+                [cutoff_start],
+            ).df()
+        finally:
+            con.close()
+        df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+        df = df.set_index(['datetime', 'ticker'])
+    if tracked is None:
+        tracked = _tracked_symbols()
 
     eq_schedule = equity_valid_days(cutoff_start, cutoff_end)
     eq_expected = ((pd.to_datetime(eq_schedule['market_close']) - pd.to_datetime(eq_schedule['market_open']))

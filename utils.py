@@ -18,24 +18,44 @@ from concurrent.futures import ThreadPoolExecutor
 # Anchored to this file's location (not the caller's cwd) so imports from
 # research/ notebooks, whose Jupyter kernel cwd is the notebook's own
 # directory rather than the project root, still resolve correctly.
-OHLCV_PATH = Path(__file__).parent / 'data' / 'ohlcv_1min.parquet'   # 1-minute OHLCV bars for all asset classes
+OHLCV_PATH = Path(__file__).parent / 'data' / 'ohlcv_1min.parquet'   # legacy snapshot, frozen — see OHLCV_DUCKDB_PATH
+OHLCV_DUCKDB_PATH = Path(__file__).parent / 'data' / 'ohlcv.duckdb'
+OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'     # written by extraction.ohlcv.download_daily_1min — full universe incl. crypto
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 BATCH_SIZE = 100                                # tickers per yfinance download call
 
 
 def get_data(tickers=None, start=None, end=None):
     """
-    Reads the OHLCV parquet and returns {ticker: DataFrame} with Title-cased columns.
-    All filters are optional — omit to load everything.
+    Reads 1-minute OHLCV bars from data/ohlcv.duckdb::ohlcv_1min_airflow
+    (written by extraction.ohlcv.download_daily_1min) and returns
+    {ticker: DataFrame} with Title-cased columns. Filters are pushed into
+    SQL rather than applied after a full load. All filters are optional —
+    omit to load everything.
     """
-    df = pd.read_parquet(OHLCV_PATH)
+    import duckdb
+
+    where, params = [], []
     if tickers is not None:
         tickers = [tickers] if isinstance(tickers, str) else tickers
-        df = df[df.index.get_level_values('ticker').isin(tickers)]
+        where.append(f"ticker IN ({', '.join('?' * len(tickers))})")
+        params.extend(tickers)
     if start is not None:
-        df = df[df.index.get_level_values('datetime') >= pd.Timestamp(start)]
+        where.append('datetime >= ?')
+        params.append(pd.Timestamp(start))
     if end is not None:
-        df = df[df.index.get_level_values('datetime') <= pd.Timestamp(end)]
+        where.append('datetime <= ?')
+        params.append(pd.Timestamp(end))
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ''
+
+    con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
+    try:
+        df = con.execute(f'SELECT * FROM {OHLCV_AIRFLOW_TABLE} {where_clause} ORDER BY datetime', params).df()
+    finally:
+        con.close()
+
+    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+    df = df.set_index(['datetime', 'ticker'])
 
     return {
         ticker: group.droplevel('ticker').rename(columns=str.title)
@@ -221,14 +241,24 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
 
 def _tracked_symbols() -> dict:
     """
-    Reads ohlcv_1min.parquet and returns unique tickers bucketed by asset class,
-    so symbols that drop out of the screener are still maintained.
-    Returns {'cryptos': [...], 'equities': [...], 'etfs': [...]} or empty lists if the file doesn't exist.
+    Reads data/ohlcv.duckdb::ohlcv_1min_airflow and returns unique tickers
+    bucketed by asset class, so symbols that drop out of the screener are
+    still maintained. Returns {'cryptos': [...], 'equities': [...], 'etfs': [...]}
+    or empty lists if the table doesn't exist yet.
     """
-    if not OHLCV_PATH.exists():
+    import duckdb
+
+    if not OHLCV_DUCKDB_PATH.exists():
         return {'cryptos': [], 'equities': [], 'etfs': []}
 
-    tickers = pd.read_parquet(OHLCV_PATH, columns=[]).index.get_level_values('ticker').unique().tolist()
+    con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if OHLCV_AIRFLOW_TABLE not in tables:
+            return {'cryptos': [], 'equities': [], 'etfs': []}
+        tickers = con.execute(f'SELECT DISTINCT ticker FROM {OHLCV_AIRFLOW_TABLE}').df()['ticker'].tolist()
+    finally:
+        con.close()
 
     # Crypto tickers on BinanceUS end with USDT/BUSD/BTC/ETH/BNB and are at least
     # 6 chars (2+ char base asset + 3-4 char quote asset) — this excludes short

@@ -4,6 +4,7 @@ from yfinance import EquityQuery
 import pandas as pd
 import requests
 import json
+import duckdb
 from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
@@ -22,10 +23,19 @@ from utils import *
 load_dotenv()
 
 # --- Paths ---
-OHLCV_PATH = Path('data/ohlcv_1min.parquet')       # 1-minute OHLCV bars for all asset classes
+OHLCV_PATH = Path('data/ohlcv_1min.parquet')       # legacy full-universe snapshot — no longer written by download_daily_1min (see OHLCV_DUCKDB_PATH)
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 BATCH_SIZE = 100                                    # tickers per data-provider call
 LAST_RUN_PATH = Path('data/ohlcv_last_run.txt')     # timestamp of the last successful 1-min OHLCV pull
+
+# download_daily_1min() writes here instead of OHLCV_PATH: the old pattern
+# (read the full parquet, concat, dedup, rewrite) loaded the entire history
+# into memory on every run and got OOM-killed (SIGKILL, return code -9) once
+# OHLCV_PATH grew past ~75M rows / ~4GB in memory. DuckDB delete-then-insert
+# never reads existing rows into Python — same fix already applied to the
+# Massive backfill's staging table, see extraction/ohlcv_massive.py.
+OHLCV_DUCKDB_PATH = Path('data/ohlcv.duckdb')
+OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'
 
 _alpaca_client = StockHistoricalDataClient(os.environ['ALPACA_API_KEY'], os.environ['ALPACA_SECRET_KEY'])
 
@@ -142,18 +152,39 @@ def download_daily_1min(equity_symbols, crypto_symbols):
         print('No data fetched.')
         return
 
-    new_data = pd.concat(frames)
-    if OHLCV_PATH.exists():
-        existing = pd.read_parquet(OHLCV_PATH)
-        combined = pd.concat([existing, new_data])
-        combined = combined[~combined.index.duplicated(keep='last')]  # keep freshest on overlap
-    else:
-        combined = new_data
+    new_data = pd.concat(frames).reset_index()  # columns: datetime, ticker, open, high, low, close, volume
 
-    combined.sort_index(inplace=True)
-    combined.to_parquet(OHLCV_PATH)
+    OHLCV_DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(OHLCV_DUCKDB_PATH))
+    try:
+        con.execute(f'''
+            CREATE TABLE IF NOT EXISTS {OHLCV_AIRFLOW_TABLE} (
+                datetime TIMESTAMPTZ NOT NULL,
+                ticker   VARCHAR NOT NULL,
+                open     DOUBLE,
+                high     DOUBLE,
+                low      DOUBLE,
+                close    DOUBLE,
+                volume   DOUBLE
+            )
+        ''')
+        con.execute(f'CREATE INDEX IF NOT EXISTS idx_{OHLCV_AIRFLOW_TABLE}_ticker ON {OHLCV_AIRFLOW_TABLE}(ticker)')
+        # Delete-then-insert on (datetime, ticker) — safe to re-run the same
+        # window without duplicating rows, and never reads existing rows into
+        # Python (unlike the old parquet read-concat-write pattern).
+        con.register('_new_data', new_data)
+        con.execute(f'''
+            DELETE FROM {OHLCV_AIRFLOW_TABLE}
+            WHERE (datetime, ticker) IN (SELECT datetime, ticker FROM _new_data)
+        ''')
+        con.execute(f'INSERT INTO {OHLCV_AIRFLOW_TABLE} SELECT * FROM _new_data')
+        con.unregister('_new_data')
+        n_rows = con.execute(f'SELECT COUNT(*) FROM {OHLCV_AIRFLOW_TABLE}').fetchone()[0]
+    finally:
+        con.close()
+
     _write_last_run(now)
-    print(f'Saved {len(combined):,} rows to {OHLCV_PATH}')
+    print(f'Saved {len(new_data):,} new rows -> {OHLCV_DUCKDB_PATH.name}::{OHLCV_AIRFLOW_TABLE} ({n_rows:,} total rows)')
 
 
 DAILY_PATH = Path('data/ohlcv_max.parquet')
