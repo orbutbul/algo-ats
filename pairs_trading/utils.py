@@ -5,7 +5,14 @@ no crypto in that file, and crypto is out of scope here regardless).
 """
 
 import json
+from math import ceil
 from pathlib import Path
+
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from pairs_trading.pairs_filter import load_metadata
 
 METADATA_PATH = Path(__file__).parent.parent / 'data' / 'metadata.json'
 
@@ -81,3 +88,89 @@ def find_pair_groups(metadata_path: Path | None = None) -> dict:
         groups[sector]['etfs'].append(ticker)
 
     return groups
+
+
+def _cluster_once(tickers: list[str], metadata: dict, n_clusters: int) -> list[list[str]]:
+    """One agglomerative-clustering pass on TF-IDF cosine distance between
+    longBusinessSummary descriptions, fit fresh on just these tickers."""
+    descriptions = [metadata.get(t, {}).get('longBusinessSummary', '') for t in tickers]
+
+    vec = TfidfVectorizer(stop_words='english')
+    tfidf = vec.fit_transform(descriptions)
+    distance = 1 - cosine_similarity(tfidf)
+
+    # 'complete' linkage (minimize max intra-cluster distance) tends to
+    # produce more size-balanced clusters than 'average' — verified: on this
+    # data 'average' produced one 76-member cluster plus four singletons
+    # from an 83-ticker bucket at n_clusters=6, nowhere near size-balanced.
+    labels = AgglomerativeClustering(
+        n_clusters=n_clusters, metric='precomputed', linkage='complete',
+    ).fit_predict(distance)
+
+    sub_groups: dict[int, list[str]] = {}
+    for ticker, label in zip(tickers, labels):
+        sub_groups.setdefault(int(label), []).append(ticker)
+    return list(sub_groups.values())
+
+
+def _cluster_bucket(tickers: list[str], metadata: dict, max_group_size: int) -> dict[int, list[str]]:
+    """
+    Splits one industry bucket into sub-clusters no larger than
+    max_group_size, via agglomerative clustering on description similarity.
+
+    A single clustering pass isn't enough to guarantee the size cap —
+    'complete' linkage clusters are more balanced than 'average' but still
+    aren't guaranteed even sizes on real text data, so any resulting
+    sub-cluster still over the cap is recursively re-clustered until every
+    sub-cluster complies. This is the actual size guarantee; the linkage
+    choice above is just about needing fewer recursive passes in practice.
+    """
+    if len(tickers) <= max_group_size:
+        return {1: tickers}
+
+    n_clusters = ceil(len(tickers) / max_group_size)
+    clusters = _cluster_once(tickers, metadata, n_clusters)
+
+    result: list[list[str]] = []
+    for cluster in clusters:
+        if len(cluster) <= max_group_size:
+            result.append(cluster)
+        else:
+            result.extend(_cluster_bucket(cluster, metadata, max_group_size).values())
+
+    return {i + 1: members for i, members in enumerate(result)}
+
+
+def refine_groups(groups: dict | None = None, max_group_size: int = 15,
+                   metadata: dict | None = None) -> dict:
+    """
+    Splits any industry bucket in find_pair_groups()'s output larger than
+    max_group_size into smaller, textually-coherent sub-groups, using
+    agglomerative clustering over the same TF-IDF cosine-similarity measure
+    pairs_filter.py already computes for its description_score.
+
+    groups   : output of find_pair_groups() (computed if not passed)
+    metadata : output of pairs_filter.load_metadata() (loaded if not passed)
+
+    Returns the same {sector: {'etfs': [...], 'industries': {...}}} shape —
+    industries above max_group_size are replaced by multiple entries keyed
+    '{industry} (1)', '{industry} (2)', etc.; industries at or under the
+    threshold are returned unchanged. ETFs are untouched — yfinance ETF
+    entries don't carry longBusinessSummary, so there's nothing to cluster
+    them by.
+    """
+    groups = groups if groups is not None else find_pair_groups()
+    metadata = metadata if metadata is not None else load_metadata()
+
+    refined: dict = {}
+    for sector, bucket in groups.items():
+        new_industries: dict[str, list[str]] = {}
+        for industry, tickers in bucket['industries'].items():
+            if len(tickers) <= max_group_size:
+                new_industries[industry] = tickers
+                continue
+            for i, members in _cluster_bucket(tickers, metadata, max_group_size).items():
+                new_industries[f'{industry} ({i})'] = members
+        refined[sector] = {'etfs': bucket['etfs'], 'industries': new_industries}
+
+    return refined
