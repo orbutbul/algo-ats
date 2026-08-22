@@ -25,32 +25,59 @@ OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 BATCH_SIZE = 100                                # tickers per yfinance download call
 
 
-def get_data(tickers=None, start=None, end=None):
-    """
-    Reads 1-minute OHLCV bars from data/ohlcv.duckdb::ohlcv_1min_airflow
-    (written by extraction.ohlcv.download_daily_1min) and returns
-    {ticker: DataFrame} with Title-cased columns. Filters are pushed into
-    SQL rather than applied after a full load. All filters are optional —
-    omit to load everything.
-    """
-    import duckdb
+def _to_utc_ts(x):
+    # datetime is stored as TIMESTAMPTZ — a naive Timestamp param compares
+    # incorrectly against it (silently matches nothing), so always localize
+    # or convert to UTC before binding.
+    ts = pd.Timestamp(x)
+    return ts.tz_localize('UTC') if ts.tzinfo is None else ts.tz_convert('UTC')
 
+
+def _ohlcv_where_clause(tickers, start, end):
+    """Shared WHERE-clause builder for get_data()/get_data_duckdb() — both
+    query a TIMESTAMPTZ `datetime` column in data/ohlcv.duckdb, just
+    different tables."""
     where, params = [], []
     if tickers is not None:
-        tickers = [tickers] if isinstance(tickers, str) else tickers
         where.append(f"ticker IN ({', '.join('?' * len(tickers))})")
         params.extend(tickers)
     if start is not None:
         where.append('datetime >= ?')
-        params.append(pd.Timestamp(start))
+        params.append(_to_utc_ts(start))
     if end is not None:
         where.append('datetime <= ?')
-        params.append(pd.Timestamp(end))
+        params.append(_to_utc_ts(end))
     where_clause = f"WHERE {' AND '.join(where)}" if where else ''
+    return where_clause, params
 
-    con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
+
+def _connect_ohlcv_duckdb(read_only: bool = True):
+    """Opens data/ohlcv.duckdb, translating a lock conflict into a clear
+    error — shared by get_data()/get_data_duckdb() since both read this
+    single-writer file. The Massive backfill (extraction/ohlcv_massive.py)
+    holds an exclusive read-write connection for hours at a time while
+    running, and DuckDB refuses even a read-only connection concurrently
+    with it (verified: raises duckdb.IOException, not a silent/partial
+    read) — callers should expect this to raise while a backfill is
+    actively running and simply retry later."""
+    import duckdb
     try:
-        df = con.execute(f'SELECT * FROM {OHLCV_AIRFLOW_TABLE} {where_clause} ORDER BY datetime', params).df()
+        return duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=read_only)
+    except duckdb.IOException as e:
+        raise RuntimeError(
+            'Could not open data/ohlcv.duckdb read-only — it is likely locked by a '
+            'currently-running Massive backfill (extraction/ohlcv_massive.py), which '
+            'holds an exclusive read-write connection while fetching. Wait for it to '
+            'finish (or pause it) and try again.'
+        ) from e
+
+
+def _run_ohlcv_query(con, query: str, params: list) -> dict:
+    """Runs `query` (closing `con` afterward either way) and reshapes the
+    result into {ticker: DataFrame} with Title-cased columns — the common
+    tail of get_data()/get_data_duckdb() once each has its own SQL."""
+    try:
+        df = con.execute(query, params).df()
     finally:
         con.close()
 
@@ -61,6 +88,20 @@ def get_data(tickers=None, start=None, end=None):
         ticker: group.droplevel('ticker').rename(columns=str.title)
         for ticker, group in df.groupby(level='ticker')
     }
+
+
+def get_data(tickers=None, start=None, end=None):
+    """
+    Reads 1-minute OHLCV bars from data/ohlcv.duckdb::ohlcv_1min_airflow
+    (written by extraction.ohlcv.download_daily_1min) and returns
+    {ticker: DataFrame} with Title-cased columns. Filters are pushed into
+    SQL rather than applied after a full load. All filters are optional —
+    omit to load everything.
+    """
+    tickers = [tickers] if isinstance(tickers, str) else tickers
+    where_clause, params = _ohlcv_where_clause(tickers, start, end)
+    con = _connect_ohlcv_duckdb()
+    return _run_ohlcv_query(con, f'SELECT * FROM {OHLCV_AIRFLOW_TABLE} {where_clause} ORDER BY datetime', params)
 
 
 _DUCKDB_FREQ_ALIASES = {
@@ -150,29 +191,8 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
     if asdf and asvbt:
         raise ValueError('asdf and asvbt are mutually exclusive — pick one return shape')
 
-    import duckdb
     tickers = [tickers] if isinstance(tickers, str) else tickers
-
-    def _to_utc_ts(x):
-        # datetime is stored as TIMESTAMPTZ — a naive Timestamp param compares
-        # incorrectly against it (silently matches nothing), so always localize
-        # or convert to UTC before binding.
-        ts = pd.Timestamp(x)
-        return ts.tz_localize('UTC') if ts.tzinfo is None else ts.tz_convert('UTC')
-
-    where = []
-    params = []
-    if tickers is not None:
-        placeholders = ', '.join('?' * len(tickers))
-        where.append(f'ticker IN ({placeholders})')
-        params.extend(tickers)
-    if start is not None:
-        where.append('datetime >= ?')
-        params.append(_to_utc_ts(start))
-    if end is not None:
-        where.append('datetime <= ?')
-        params.append(_to_utc_ts(end))
-    where_clause = f"WHERE {' AND '.join(where)}" if where else ''
+    where_clause, params = _ohlcv_where_clause(tickers, start, end)
 
     use_sql_pushdown = (
         freq in _DUCKDB_BUCKET_SQL
@@ -198,28 +218,8 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
     else:
         query = f'SELECT * FROM massive_1min {where_clause} ORDER BY datetime'
 
-    try:
-        con = duckdb.connect(str(Path(__file__).parent / 'data' / 'ohlcv.duckdb'), read_only=True)
-    except duckdb.IOException as e:
-        raise RuntimeError(
-            'Could not open data/ohlcv.duckdb read-only — it is likely locked by a '
-            'currently-running Massive backfill (extraction/ohlcv_massive.py), which '
-            'holds an exclusive read-write connection while fetching. Wait for it to '
-            'finish (or pause it) and try again.'
-        ) from e
-
-    try:
-        df = con.execute(query, params).df()
-    finally:
-        con.close()
-
-    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
-    df = df.set_index(['datetime', 'ticker'])
-
-    per_ticker = {
-        ticker: group.droplevel('ticker').rename(columns=str.title)
-        for ticker, group in df.groupby(level='ticker')
-    }
+    con = _connect_ohlcv_duckdb()
+    per_ticker = _run_ohlcv_query(con, query, params)
 
     if freq is not None and not use_sql_pushdown:
         rule = _DUCKDB_FREQ_ALIASES.get(freq, freq)
