@@ -1,0 +1,4 @@
+# Pipeline resumability bookkeeping — internal, regenerated/appended by
+# pipeline.find_candidate_pairs(); candidate_pairs.csv is the real output.
+.candidate_pairs_raw.csv
+.processed_groups.csv
