@@ -8,11 +8,19 @@ import json
 from math import ceil
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import vectorbtpro as vbt
+from plotly.graph_objects import Scatter
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from pairs_trading.pairs_filter import load_metadata
+from pairs_trading.pair_tests import (
+    _crossing_dates, _filter_coverage, _load_group_daily_closes,
+    _pair_correlation_stats, _pair_cointegration_stats, _rolling_corr_matrices,
+)
 
 METADATA_PATH = Path(__file__).parent.parent / 'data' / 'metadata.json'
 
@@ -174,3 +182,82 @@ def refine_groups(groups: dict | None = None, max_group_size: int = 15,
         refined[sector] = {'etfs': bucket['etfs'], 'industries': new_industries}
 
     return refined
+
+
+def plot_pair_dashboard(
+    ticker_a: str,
+    ticker_b: str,
+    corr_window: int = 75,
+    recompute_freq: str = 'W',
+    stability_lookback: int = 6,
+    corr_threshold: float = 0.65,
+    stability_std_cap: float = 0.15,
+    coint_pvalue_threshold: float = 0.05,
+    min_crossings: int = 6,
+    coint_lookback_months: int = 6,
+) -> vbt.utils.figure.Figure:
+    """
+    Diagnostic dashboard for one candidate pair — fetches its own data from
+    data/ohlcv.duckdb::massive_1min, no pre-loaded prices required.
+
+    Plots both tickers' cumulative log returns (indexed to 0 at the start of
+    their shared history, so the two lines are directly comparable
+    regardless of absolute price level) via vbt's plotting accessor, with
+    markers where the two lines cross each other — the same
+    sign-flip-counting rule pair_tests.compute_cointegration_test() uses for
+    its n_crossings, applied here to the normalized price lines themselves
+    rather than the hedge-ratio spread, so the crossings are visible
+    directly on the chart.
+
+    The title annotation reports the full picture computed fresh for just
+    this pair, via the exact same per-pair helpers
+    pair_tests.compute_correlation_prefilter()/compute_cointegration_test()
+    call internally (_pair_correlation_stats/_pair_cointegration_stats) —
+    one canonical implementation shared by the batch pipeline and this
+    single-pair dashboard, not a re-derived copy: latest/min/std rolling
+    correlation, both-direction cointegration p-values, hedge ratio, and the
+    Stage-B spread's own n_crossings (which can differ from the chart's
+    normalized-price crossings — they're different series by construction).
+    The cointegration stats are windowed to the trailing coint_lookback_months
+    (default 6) of price history, same as compute_cointegration_test() —
+    the price panel above still plots the full history for visual context.
+    """
+    daily_close = _load_group_daily_closes([ticker_a, ticker_b])
+    daily_close, excluded = _filter_coverage(daily_close)
+    if excluded:
+        raise ValueError(f'Insufficient coverage for: {excluded} — cannot build a pair dashboard.')
+
+    log_price = np.log(daily_close)
+    cum_log = log_price - log_price.iloc[0]
+    crossing_dates = _crossing_dates(cum_log[ticker_a] - cum_log[ticker_b])
+
+    fig = cum_log[ticker_a].vbt.plot(trace_kwargs=dict(name=ticker_a))
+    cum_log[ticker_b].vbt.plot(trace_kwargs=dict(name=ticker_b), fig=fig)
+    fig.add_trace(Scatter(
+        x=crossing_dates, y=cum_log[ticker_a].loc[crossing_dates],
+        mode='markers', name='crossings',
+        marker=dict(symbol='x', size=9, color='black'),
+    ))
+
+    returns = np.log(daily_close / daily_close.shift(1)).iloc[1:]
+    matrices = _rolling_corr_matrices(returns, corr_window, recompute_freq)
+    dates = sorted(matrices.keys())
+    corr_stats = _pair_correlation_stats(
+        ticker_a, ticker_b, matrices, dates, stability_lookback, corr_threshold, stability_std_cap,
+    )
+    coint_stats = _pair_cointegration_stats(
+        daily_close[ticker_a], daily_close[ticker_b], coint_pvalue_threshold, min_crossings, coint_lookback_months,
+    )
+
+    title = (
+        f'{ticker_a} vs {ticker_b}  '
+        f'&nbsp;|&nbsp;  corr: latest={corr_stats["latest_corr"]:.3f} min={corr_stats["min_corr"]:.3f} '
+        f'std={corr_stats["std_corr"]:.3f} ({"PASS" if corr_stats["passed"] else "fail"})'
+        f'&nbsp;|&nbsp;  coint: p_ab={coint_stats["pvalue_ab"]:.3f} p_ba={coint_stats["pvalue_ba"]:.3f} '
+        f'hedge_ratio={coint_stats["hedge_ratio"]:.3f} spread_crossings={coint_stats["n_crossings"]} '
+        f'({"PASS" if coint_stats["passed"] else "fail"})'
+        f'&nbsp;|&nbsp;  chart crossings={len(crossing_dates)}'
+    )
+    fig.update_layout(title=dict(text=title, font=dict(size=12)), yaxis_title='cumulative log return')
+
+    return fig
