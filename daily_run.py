@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 # When launched via pythonw.exe (no console, so nothing pops up on screen),
@@ -25,12 +25,10 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
-import pandas_market_calendars as mcal
-
 from utils import screen_symbols
 from extraction.ohlcv import download_daily_1min
 from extraction.fundamentals import fundamentals, FUNDAMENTALS_SPECS
-from validation import validate_screen, validate_ohlcv, validate_fundamentals, send_alert
+from validation import validate_screen, validate_ohlcv, validate_fundamentals, is_market_day, send_alert
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,13 +44,6 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger('daily_run')
-
-
-def is_market_day() -> bool:
-    nyse = mcal.get_calendar('NYSE')
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    schedule = nyse.schedule(start_date=today, end_date=today)
-    return not schedule.empty
 
 
 def run():
