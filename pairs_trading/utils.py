@@ -11,11 +11,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import vectorbtpro as vbt
-from plotly.graph_objects import Scatter
+from plotly.graph_objects import Figure, Scatter
+from plotly.subplots import make_subplots
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from pairs_trading.kalman import _kalman_filter_hedge_ratio
 from pairs_trading.pairs_filter import load_metadata
 from pairs_trading.pair_tests import (
     _crossing_dates, _filter_coverage, _load_group_daily_closes,
@@ -260,4 +262,78 @@ def plot_pair_dashboard(
     )
     fig.update_layout(title=dict(text=title, font=dict(size=12)), yaxis_title='cumulative log return')
 
+    return fig
+
+
+def plot_kalman_dashboard(
+    ticker_a: str,
+    ticker_b: str,
+    delta: float = 1e-4,
+    obs_covariance: float = 1e-3,
+    lookback_months: int | None = None,
+) -> Figure:
+    """
+    Three-panel Kalman dynamic-hedge-ratio dashboard for one candidate pair
+    — fetches its own data from data/ohlcv.duckdb::massive_1min, no
+    pre-loaded prices required (same self-contained pattern as
+    plot_pair_dashboard).
+
+    Panels (top to bottom, shared x-axis):
+    1. Both tickers' log prices.
+    2. The Kalman-filtered hedge ratio beta_t
+       (pairs_trading.kalman._kalman_filter_hedge_ratio), run directly on
+       the same log prices as panel 1 so hedge ratio and price share a
+       scale.
+    3. The hedge-ratio-adjusted log price, log(price_a) - beta_t *
+       log(price_b) — the mean-reverting series a pairs trade is actually
+       built on.
+
+    Panel 3 uses beta_t's updated (post-observation) value at each bar,
+    which is fine for visual diagnosis but is NOT a lookahead-safe backtest
+    signal — _kalman_filter_hedge_ratio's own 'spread' column (built from
+    each bar's pre-observation predicted state) is the lookahead-safe
+    series to trade on.
+
+    Opens the figure in the system's default browser via
+    fig.show(renderer='browser') (same behavior as calling fig.show() on a
+    plain plotly figure outside a notebook) before returning it, so calling
+    this function is enough on its own — no separate .show() call needed.
+    """
+    daily_close = _load_group_daily_closes([ticker_a, ticker_b])
+    daily_close, excluded = _filter_coverage(daily_close)
+    if excluded:
+        raise ValueError(f'Insufficient coverage for: {excluded} — cannot build a Kalman dashboard.')
+
+    if lookback_months is not None:
+        cutoff = daily_close.index.max() - pd.DateOffset(months=lookback_months)
+        daily_close = daily_close[daily_close.index >= cutoff]
+
+    log_price = np.log(daily_close)
+    kalman = _kalman_filter_hedge_ratio(log_price[ticker_a], log_price[ticker_b], delta, obs_covariance)
+    adjusted = log_price[ticker_a] - kalman['beta'] * log_price[ticker_b]
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        subplot_titles=('log price', 'kalman hedge ratio (beta)', 'hedge-ratio-adjusted log price'),
+    )
+    fig.add_trace(Scatter(x=log_price.index, y=log_price[ticker_a], name=ticker_a), row=1, col=1)
+    fig.add_trace(Scatter(x=log_price.index, y=log_price[ticker_b], name=ticker_b), row=1, col=1)
+    fig.add_trace(Scatter(x=kalman.index, y=kalman['beta'], name='beta', line=dict(color='black')), row=2, col=1)
+    fig.add_trace(Scatter(
+        x=adjusted.index, y=adjusted, name=f'{ticker_a} - beta*{ticker_b}', line=dict(color='firebrick'),
+    ), row=3, col=1)
+
+    fig.update_layout(
+        title=dict(
+            text=f'{ticker_a} vs {ticker_b} — Kalman dynamic hedge ratio '
+                 f'(delta={delta:g}, obs_covariance={obs_covariance:g})',
+            font=dict(size=12),
+        ),
+        height=800, showlegend=True,
+    )
+    fig.update_yaxes(title_text='log price', row=1, col=1)
+    fig.update_yaxes(title_text='beta', row=2, col=1)
+    fig.update_yaxes(title_text='adjusted log price', row=3, col=1)
+
+    fig.show(renderer='browser')
     return fig
