@@ -1,10 +1,18 @@
 """
-extraction/ohlcv_robinhood.py — resumable historical backfill of 1-min
-equity/ETF OHLCV bars from Robinhood (via the Robinhood MCP trading server,
-reached directly through robinhood_client.RobinhoodMCPClient, bypassing
-Claude Code). Checkpointed into a DuckDB staging table
-(data/ohlcv.duckdb::robinhood_1min), resumable via a per-ticker progress
-ledger. Run manually: `python -m extraction.ohlcv_robinhood`.
+extraction/ohlcv_robinhood.py — 1-min equity/ETF OHLCV bars from Robinhood
+(via the Robinhood MCP trading server, reached directly through
+robinhood_client.RobinhoodMCPClient, bypassing Claude Code), written into
+data/ohlcv.duckdb::robinhood_1min. Two entry points:
+
+  - build_robinhood_ohlcv() — resumable historical backfill over an
+    arbitrary date range, checkpointed with a per-ticker progress ledger
+    (PROGRESS_PATH). Run manually: `python -m extraction.ohlcv_robinhood`.
+  - download_daily_robinhood() — daily incremental pull of just the most
+    recent day (plus catch-up if a run was missed), tracked with a single
+    last-run date (LAST_RUN_PATH) instead of the per-ticker ledger, since a
+    daily task must always refetch the target day rather than skip tickers
+    already marked done. Run manually: `python -m extraction.ohlcv_robinhood
+    --daily`; wired into airflow/dags/daily_run_dag.py for the scheduled run.
 
 Mirrors extraction/ohlcv_massive.py's backfill pattern (progress ledger,
 checkpointed delete-then-insert flushes, per-ticker error tracking) with a
@@ -51,6 +59,7 @@ from utils import _tracked_symbols
 DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv.duckdb'
 STAGING_TABLE = 'robinhood_1min'
 PROGRESS_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_robinhood_progress.json'
+LAST_RUN_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_robinhood_last_run.txt'
 RH_BATCH_SIZE = 10        # symbols per get_equity_historicals call (MCP tool's hard cap)
 RH_BOUNDS = '24_5'        # full 24h Mon-Fri, not just regular trading hours
 RH_CHUNK_DAYS = 3         # calendar days per request window -- at bounds='24_5' that's up
@@ -159,6 +168,17 @@ def _load_progress() -> dict:
 def _save_progress(progress: dict) -> None:
     PROGRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROGRESS_PATH.write_text(json.dumps(progress, indent=2, default=str))
+
+
+def _read_last_run() -> date | None:
+    if not LAST_RUN_PATH.exists():
+        return None
+    return date.fromisoformat(LAST_RUN_PATH.read_text().strip())
+
+
+def _write_last_run(d: date) -> None:
+    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_RUN_PATH.write_text(d.isoformat())
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
@@ -294,13 +314,103 @@ def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None =
     print(f'Done. {n_done} succeeded, {n_error} failed. See {PROGRESS_PATH} for per-ticker detail.')
 
 
+def download_daily_robinhood(tickers: list[str] | None = None) -> None:
+    """
+    Pulls today's day of 1-min bars (bounds=RH_BOUNDS) for `tickers`
+    (default: tracked equities + ETFs) into data/ohlcv.duckdb::robinhood_1min,
+    deleting-then-reinserting only the exact (datetime, ticker) rows being
+    written -- same dedup pattern as extraction.ohlcv.download_daily_1min --
+    so re-running the same day is always safe.
+
+    end defaults to *today*, not yesterday: this is meant to be triggered
+    at/after that day's market close (matching download_daily_1min's
+    rolling-24h-to-now window, which for the same reason ends up covering
+    the session that just closed), so "today" is the session it should
+    capture. Called on a non-trading day (weekend/holiday) it just returns
+    0 bars -- harmless, but the caller (see airflow/dags/daily_run_dag.py)
+    should still gate on validation.is_market_day() to skip the wasted
+    calls, same as the Alpaca pull did.
+
+    Unlike build_robinhood_ohlcv(), this always (re)fetches the target range
+    rather than skipping tickers already marked done: a daily task needs
+    fresh data every run, not a one-time resumable backfill, so it tracks
+    progress with a single last-run date (LAST_RUN_PATH) instead of the
+    per-ticker PROGRESS_PATH ledger used by the backfill.
+
+    If the last successful run was more than a day ago (e.g. the scheduler
+    was paused), backfills every missed day up through today instead of
+    just today alone, chunked via RH_CHUNK_DAYS/_date_chunks like the
+    backfill. One batch's failure (after _call_historicals' own retries) is
+    logged and skipped rather than aborting the run -- a bad symbol or a
+    transient outage doesn't block the other tickers, and gets picked up
+    again on the next scheduled run since the last-run marker still
+    advances (see below).
+    """
+    end = date.today()
+    last_run = _read_last_run()
+    start = min(last_run + timedelta(days=1), end) if last_run else end
+
+    if tickers is None:
+        tracked = _tracked_symbols()
+        tickers = sorted(set(tracked['equities']) | set(tracked['etfs']))
+
+    print(f'Pulling {start} .. {end} for {len(tickers)} tickers (bounds={RH_BOUNDS})')
+
+    client = RobinhoodMCPClient()
+    con = _connect()
+    n_ok, n_failed = 0, 0
+
+    n_batches = (len(tickers) + RH_BATCH_SIZE - 1) // RH_BATCH_SIZE
+    for bi in range(0, len(tickers), RH_BATCH_SIZE):
+        batch = tickers[bi:bi + RH_BATCH_SIZE]
+        batch_num = bi // RH_BATCH_SIZE + 1
+        try:
+            chunk_frames = [
+                _bars_to_frame(_call_historicals(client, batch, chunk_start, chunk_end))
+                for chunk_start, chunk_end in _date_chunks(start, end, RH_CHUNK_DAYS)
+            ]
+            batch_df = pd.concat(chunk_frames) if chunk_frames else pd.DataFrame()
+        except Exception as e:
+            print(f'[batch {batch_num}/{n_batches}] {batch}: FAILED -- {e}')
+            n_failed += len(batch)
+            continue
+
+        if len(batch_df):
+            new_data = batch_df.reset_index()
+            con.register('_new_data', new_data)
+            con.execute(f'''
+                DELETE FROM {STAGING_TABLE}
+                WHERE (datetime, ticker) IN (SELECT datetime, ticker FROM _new_data)
+            ''')
+            con.execute(f'INSERT INTO {STAGING_TABLE} SELECT * FROM _new_data')
+            con.unregister('_new_data')
+        n_ok += len(batch)
+        print(f'[batch {batch_num}/{n_batches}] {batch}: {len(batch_df)} bars')
+
+    n_rows = con.execute(f'SELECT COUNT(*) FROM {STAGING_TABLE}').fetchone()[0]
+    con.close()
+
+    # Advance the last-run marker even if some batches failed -- otherwise a
+    # single bad symbol would wedge every future run into re-attempting the
+    # same window forever. Failed tickers just get picked up again on the
+    # next scheduled run, same as a transient miss in download_daily_1min.
+    _write_last_run(end)
+    print(f'Done. {n_ok} tickers ok, {n_failed} failed, {n_rows:,} total rows in {DUCKDB_PATH.name}::{STAGING_TABLE}')
+
+
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description='Backfill 1-min equity/ETF OHLCV from Robinhood (resumable).')
+    p = argparse.ArgumentParser(description='Backfill or daily-pull 1-min equity/ETF OHLCV from Robinhood.')
+    p.add_argument('--daily', action='store_true',
+                    help='Run download_daily_robinhood() (last day / missed-day catch-up) instead of the resumable backfill.')
     p.add_argument('--start', type=date.fromisoformat, default=None,
-                    help='Defaults to 90 days before --end.')
+                    help='Backfill mode only. Defaults to 90 days before --end.')
     p.add_argument('--end', type=date.fromisoformat, default=None,
-                    help='Defaults to yesterday.')
-    p.add_argument('--force', action='store_true', help='Re-fetch tickers already marked done.')
+                    help='Backfill mode only. Defaults to yesterday.')
+    p.add_argument('--force', action='store_true',
+                    help='Backfill mode only. Re-fetch tickers already marked done.')
     args = p.parse_args()
 
-    build_robinhood_ohlcv(start=args.start, end=args.end, force=args.force)
+    if args.daily:
+        download_daily_robinhood()
+    else:
+        build_robinhood_ohlcv(start=args.start, end=args.end, force=args.force)
