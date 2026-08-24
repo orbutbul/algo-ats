@@ -199,6 +199,26 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
+def _massive_last_date() -> date | None:
+    """
+    Returns the most recent date in ohlcv.duckdb::massive_1min (None if the
+    DB/table doesn't exist or is empty) -- used as build_robinhood_ohlcv()'s
+    default start date, so the Robinhood backfill picks up right where the
+    Massive backfill's coverage ends rather than an arbitrary fixed lookback.
+    """
+    if not DUCKDB_PATH.exists():
+        return None
+    con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if 'massive_1min' not in tables:
+            return None
+        row = con.execute('SELECT MAX(datetime) FROM massive_1min').fetchone()
+    finally:
+        con.close()
+    return row[0].date() if row and row[0] is not None else None
+
+
 def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None = None,
                            end: date | None = None, force: bool = False,
                            checkpoint_every: int = CHECKPOINT_EVERY) -> None:
@@ -208,11 +228,15 @@ def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None =
     days per call. Resumable: skips tickers already marked 'done' in
     PROGRESS_PATH unless force=True.
 
-    end defaults to yesterday, start to 90 days before end -- both resolved
+    end defaults to yesterday. start defaults to massive_1min's last date
+    (extending that backfill's coverage forward instead of leaving a gap
+    between it and the daily Robinhood pull), falling back to 90 days
+    before end if massive_1min doesn't exist or is empty. Both resolved
     fresh on every call, not frozen at import time.
     """
     end = end or (date.today() - timedelta(days=1))
-    start = start or (end - timedelta(days=90))
+    if start is None:
+        start = _massive_last_date() or (end - timedelta(days=90))
 
     if tickers is None:
         tracked = _tracked_symbols()
@@ -403,7 +427,8 @@ if __name__ == '__main__':
     p.add_argument('--daily', action='store_true',
                     help='Run download_daily_robinhood() (last day / missed-day catch-up) instead of the resumable backfill.')
     p.add_argument('--start', type=date.fromisoformat, default=None,
-                    help='Backfill mode only. Defaults to 90 days before --end.')
+                    help='Backfill mode only. Defaults to massive_1min\'s last date '
+                         '(90 days before --end if that table is missing/empty).')
     p.add_argument('--end', type=date.fromisoformat, default=None,
                     help='Backfill mode only. Defaults to yesterday.')
     p.add_argument('--force', action='store_true',
