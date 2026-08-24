@@ -78,22 +78,27 @@ def validate_screen(screen: dict) -> list[str]:
     return []
 
 
-def validate_ohlcv(screen: dict, run_date: date | None = None) -> list[str]:
+def validate_ohlcv(screen: dict, run_date: date | None = None, table: str = OHLCV_AIRFLOW_TABLE) -> list[str]:
+    """Checks `table` in data/ohlcv.duckdb for `run_date` rows with an
+    acceptable close/volume null rate. `table` defaults to the Alpaca
+    ohlcv_1min_airflow table; pass table='robinhood_1min' (or any other
+    table sharing the same datetime/close/volume columns) to validate a
+    different source instead."""
     run_date = run_date or datetime.now(timezone.utc).date()
     if not is_market_day(run_date):
         return []
 
-    label = f'{OHLCV_DUCKDB_PATH}::{OHLCV_AIRFLOW_TABLE}'
+    label = f'{OHLCV_DUCKDB_PATH}::{table}'
     if not OHLCV_DUCKDB_PATH.exists():
         return [f'{label} does not exist']
 
     con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
     try:
         tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
-        if OHLCV_AIRFLOW_TABLE not in tables:
+        if table not in tables:
             return [f'{label} does not exist']
         todays = con.execute(
-            f'SELECT close, volume FROM {OHLCV_AIRFLOW_TABLE} WHERE datetime::DATE = ?',
+            f'SELECT close, volume FROM {table} WHERE datetime::DATE = ?',
             [run_date],
         ).df()
     finally:
