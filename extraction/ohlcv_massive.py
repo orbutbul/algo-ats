@@ -14,14 +14,14 @@ the staging data grew into the multiple-GB range.
 
 Does NOT touch crypto (already ~100% complete via Binance) or the daily
 incremental Alpaca pull in extraction/ohlcv.py — this only rebuilds
-equity/ETF *history*. Promote the result into data/ohlcv_1min.parquet with
-`python -m extraction.ohlcv_massive --promote` once the backfill finishes.
+equity/ETF *history*, staged into data/ohlcv.duckdb::massive_1min and left
+there (no promotion into a parquet snapshot — see extraction/ohlcv.py and
+extraction/ohlcv_robinhood.py for the same DuckDB-only convention).
 """
 
 import argparse
 import json
 import os
-import shutil
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -32,7 +32,7 @@ import requests
 from dotenv import load_dotenv
 
 from extraction.ohlcv import _to_alpaca_symbol, OHLCV_COLS
-from utils import OHLCV_PATH, _tracked_symbols
+from utils import _tracked_symbols
 
 load_dotenv()
 
@@ -229,51 +229,11 @@ def build_massive_ohlcv(tickers: list[str] | None = None, start: date = DEFAULT_
           f'See {PROGRESS_PATH} for per-ticker detail.')
 
 
-def promote_to_main() -> None:
-    """
-    Backs up the current OHLCV_PATH, then replaces its equities/ETF rows with
-    the DuckDB staging table's contents while preserving its crypto rows
-    (still Binance-sourced, untouched).
-    """
-    if not DUCKDB_PATH.exists():
-        raise FileNotFoundError(f'{DUCKDB_PATH} not found — run build_massive_ohlcv() first')
-
-    con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
-    massive_df = con.execute(f'SELECT * FROM {STAGING_TABLE}').df()
-    con.close()
-    if massive_df.empty:
-        raise ValueError(f'{STAGING_TABLE} is empty — run build_massive_ohlcv() first')
-    massive_df = massive_df.set_index(['datetime', 'ticker'])[OHLCV_COLS].sort_index()
-
-    if OHLCV_PATH.exists():
-        backup_path = OHLCV_PATH.with_name(
-            f'{OHLCV_PATH.stem}_backup_{datetime.now():%Y%m%d_%H%M%S}{OHLCV_PATH.suffix}'
-        )
-        shutil.copy2(OHLCV_PATH, backup_path)
-        print(f'Backed up existing OHLCV to {backup_path}')
-
-        existing = pd.read_parquet(OHLCV_PATH)
-        crypto_tickers = set(_tracked_symbols()['cryptos'])
-        crypto_mask = existing.index.get_level_values('ticker').isin(crypto_tickers)
-        crypto_only = existing[crypto_mask]
-    else:
-        crypto_only = pd.DataFrame(columns=OHLCV_COLS)
-
-    combined = pd.concat([crypto_only, massive_df]).sort_index()
-    combined.to_parquet(OHLCV_PATH)
-    print(f'Promoted {len(massive_df):,} equity/ETF rows + {len(crypto_only):,} crypto rows -> {OHLCV_PATH}')
-
-
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Backfill 1-min equity/ETF OHLCV from Massive (rate-limited, resumable).')
     p.add_argument('--start', type=date.fromisoformat, default=DEFAULT_START)
     p.add_argument('--end', type=date.fromisoformat, default=DEFAULT_END)
     p.add_argument('--force', action='store_true', help='Re-fetch tickers already marked done.')
-    p.add_argument('--promote', action='store_true',
-                    help='Skip fetching; just promote the existing DuckDB staging table into ohlcv_1min.parquet.')
     args = p.parse_args()
 
-    if args.promote:
-        promote_to_main()
-    else:
-        build_massive_ohlcv(start=args.start, end=args.end, force=args.force)
+    build_massive_ohlcv(start=args.start, end=args.end, force=args.force)
