@@ -65,11 +65,31 @@ def alert_on_task_failure(context: dict) -> None:
     """Airflow task-level on_failure_callback — fires once per task, only
     after its retries are exhausted (not once per attempt)."""
     ti = context['task_instance']
+
+    exc = context.get('exception')
+    # First line only (an exception's str() can be many lines -- e.g. the
+    # validate task raises Exception('\n'.join(issues)), one issue per
+    # line) so the headline stays a single readable sentence; the full
+    # exception still goes in the body below. Newlines are also not valid
+    # in an HTTP header value, which the subject becomes (ntfy's Title
+    # header) -- splitlines()[0] rules that out along with keeping it short.
+    exc_summary = str(exc).strip().splitlines()[0] if exc else 'unknown error'
+    if len(exc_summary) > 60:
+        exc_summary = exc_summary[:57] + '...'
+
+    logical_date = context.get('logical_date')
+    when = logical_date.strftime('%Y-%m-%d %H:%M %Z') if logical_date else str(context.get('run_id'))
+
+    # This becomes ntfy's Title, which is what's actually shown up front in
+    # the notification (bold, never truncated the way a body preview can
+    # be) -- e.g. "daily_run failed: robinhood_1min: no rows for 2026-08-25
+    # (market day) at 2026-08-25 17:00 EDT".
+    subject = f'{ti.dag_id} failed: {exc_summary} at {when}'
     body = (
-        f"DAG: {ti.dag_id}\nTask: {ti.task_id}\nRun: {context.get('run_id')}\n"
-        f"Log: {ti.log_url}\n\nException:\n{context.get('exception')}"
+        f"Task: {ti.task_id}\nRun: {context.get('run_id')}\n"
+        f"Log: {ti.log_url}\n\nException:\n{exc}"
     )
-    send_alert(f'[ATS] Airflow task failed: {ti.dag_id}.{ti.task_id}', body)
+    send_alert(subject, body)
 
 
 def validate_screen(screen: dict) -> list[str]:
