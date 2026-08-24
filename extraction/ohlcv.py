@@ -36,6 +36,7 @@ LAST_RUN_PATH = Path('data/ohlcv_last_run.txt')     # timestamp of the last succ
 # Massive backfill's staging table, see extraction/ohlcv_massive.py.
 OHLCV_DUCKDB_PATH = Path('data/ohlcv.duckdb')
 OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'
+OHLCV_MAX_TABLE = 'ohlcv_max_daily'                 # written by get_max_data() — daily bars, max history per ticker
 
 _alpaca_client = StockHistoricalDataClient(os.environ['ALPACA_API_KEY'], os.environ['ALPACA_SECRET_KEY'])
 
@@ -187,17 +188,17 @@ def download_daily_1min(equity_symbols, crypto_symbols):
     print(f'Saved {len(new_data):,} new rows -> {OHLCV_DUCKDB_PATH.name}::{OHLCV_AIRFLOW_TABLE} ({n_rows:,} total rows)')
 
 
-DAILY_PATH = Path('data/ohlcv_max.parquet')
-
-
 def get_max_data(symbols: list[str] | None = None) -> None:
-
     """
     Download the maximum available daily OHLCV history for equities and ETFs
-    and save to data/ohlcv_daily.parquet.
+    into data/ohlcv.duckdb::ohlcv_max_daily.
 
-    If the file already exists, only fetches data after the last stored date
-    so re-running is fast and safe.
+    Per-ticker last date (queried via SQL, not a full table read) drives
+    incremental fetches — new tickers get full history, existing tickers
+    fetch from their last stored date onward. Delete-then-insert only the
+    exact (datetime, ticker) rows being reinserted (same pattern as
+    download_daily_1min), so older history for an incrementally-updated
+    ticker is never touched, let alone the whole table read into Python.
 
     symbols: explicit list of tickers, or None to use screen_symbols().
     """
@@ -205,23 +206,34 @@ def get_max_data(symbols: list[str] | None = None) -> None:
         screen = screen_symbols()
         symbols = screen['equities'] + screen['etfs']
 
-    DAILY_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Per-ticker last date so new tickers always get full history
-    if DAILY_PATH.exists():
-        existing = pd.read_parquet(DAILY_PATH)
-        last_per_ticker = (
-            existing.groupby(level='ticker')
-            .apply(lambda x: x.index.get_level_values('datetime').max().date().isoformat())
-            .to_dict()
+    OHLCV_DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(OHLCV_DUCKDB_PATH))
+    con.execute(f'''
+        CREATE TABLE IF NOT EXISTS {OHLCV_MAX_TABLE} (
+            datetime TIMESTAMPTZ NOT NULL,
+            ticker   VARCHAR NOT NULL,
+            open     DOUBLE,
+            high     DOUBLE,
+            low      DOUBLE,
+            close    DOUBLE,
+            volume   DOUBLE
         )
-    else:
-        existing = None
-        last_per_ticker = {}
+    ''')
+    con.execute(f'CREATE INDEX IF NOT EXISTS idx_{OHLCV_MAX_TABLE}_ticker ON {OHLCV_MAX_TABLE}(ticker)')
 
-    new_tickers  = [s for s in symbols if s not in last_per_ticker]
-    old_tickers  = [s for s in symbols if s in last_per_ticker]
+    existing_tickers = set(con.execute(f'SELECT DISTINCT ticker FROM {OHLCV_MAX_TABLE}').df()['ticker'])
+    new_tickers = [s for s in symbols if s not in existing_tickers]
+    old_tickers = [s for s in symbols if s in existing_tickers]
     print(f'{len(new_tickers):,} new tickers (full history) + {len(old_tickers):,} existing (incremental)')
+
+    last_per_ticker = {}
+    if old_tickers:
+        placeholders = ', '.join('?' * len(old_tickers))
+        rows = con.execute(
+            f'SELECT ticker, MAX(datetime) FROM {OHLCV_MAX_TABLE} WHERE ticker IN ({placeholders}) GROUP BY ticker',
+            old_tickers,
+        ).fetchall()
+        last_per_ticker = {t: d.date().isoformat() for t, d in rows}
 
     def _download_batches(tickers, extra_kwargs):
         frames = []
@@ -254,18 +266,26 @@ def get_max_data(symbols: list[str] | None = None) -> None:
 
     if not frames:
         print('No data fetched.')
+        con.close()
         return
 
-    new_data = pd.concat(frames)
-    if existing is not None:
-        combined = pd.concat([existing, new_data])
-        combined = combined[~combined.index.duplicated(keep='last')]
-    else:
-        combined = new_data
+    new_data = pd.concat(frames).reset_index()  # columns: datetime, ticker, open, high, low, close, volume
+    # yfinance's daily index is tz-naive — pin it to UTC so it matches the
+    # TIMESTAMPTZ column (and every other table in this file).
+    if new_data['datetime'].dt.tz is None:
+        new_data['datetime'] = new_data['datetime'].dt.tz_localize('UTC')
 
-    combined.sort_index(inplace=True)
-    combined.to_parquet(DAILY_PATH)
-    print(f'Saved {len(combined):,} rows ({combined.index.get_level_values("ticker").nunique():,} tickers) to {DAILY_PATH}')
+    con.register('_new_data', new_data)
+    con.execute(f'''
+        DELETE FROM {OHLCV_MAX_TABLE}
+        WHERE (datetime, ticker) IN (SELECT datetime, ticker FROM _new_data)
+    ''')
+    con.execute(f'INSERT INTO {OHLCV_MAX_TABLE} SELECT * FROM _new_data')
+    con.unregister('_new_data')
+    n_rows = con.execute(f'SELECT COUNT(*) FROM {OHLCV_MAX_TABLE}').fetchone()[0]
+    con.close()
+
+    print(f'Saved {len(new_data):,} new rows -> {OHLCV_DUCKDB_PATH.name}::{OHLCV_MAX_TABLE} ({n_rows:,} total rows)')
 
 
 def upsert_new_symbol(symbol: str, max: bool = False, daily: bool = False) -> None:
@@ -273,8 +293,8 @@ def upsert_new_symbol(symbol: str, max: bool = False, daily: bool = False) -> No
     Validate a symbol on yfinance, then optionally fetch and append its data.
 
     symbol : ticker to add (e.g. 'PLTR', 'ETHUSDT')
-    max    : fetch full daily history and append to data/ohlcv_daily.parquet
-    daily  : fetch today's 1-min bars and append to data/ohlcv_1min.parquet
+    max    : fetch full daily history into data/ohlcv.duckdb::ohlcv_max_daily
+    daily  : fetch today's 1-min bars into data/ohlcv.duckdb::ohlcv_1min_airflow
 
     Crypto (quoteType='CRYPTOCURRENCY') is supported for daily (via Binance)
     but not for max (yfinance daily history only covers equities/ETFs).
