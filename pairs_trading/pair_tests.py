@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.regression.rolling import RollingOLS
 from statsmodels.tsa.stattools import coint
 
 from utils import get_data_duckdb
@@ -252,6 +253,26 @@ def _crossing_dates(spread: pd.Series) -> pd.DatetimeIndex:
     return spread.index[flips]
 
 
+def _threshold_crossings(series: pd.Series, level: float, direction: str) -> pd.Series:
+    """
+    Boolean mask, indexed like `series`, True at points where `series`
+    crosses `level` in `direction` ('down': prior bar >= level, this bar <
+    level; 'up': prior bar <= level, this bar > level) — the single
+    canonical crossing-direction test for threshold-based entry/exit
+    signals (e.g. a z-score crossing +/-z_entry / +/-z_exit), so a caller
+    needing the same event on two different series (e.g. plotting both the
+    z-score panel and a synthetic spread-price panel's entry/exit markers
+    at the same timestamps) computes it once and reuses the mask rather
+    than re-deriving it per plot.
+    """
+    prev = series.shift(1)
+    if direction == 'down':
+        return (prev >= level) & (series < level)
+    if direction == 'up':
+        return (prev <= level) & (series > level)
+    raise ValueError(f"direction must be 'up' or 'down', got {direction!r}")
+
+
 def _pair_cointegration_stats(
     price_a: pd.Series, price_b: pd.Series, coint_pvalue_threshold: float, min_crossings: int,
     lookback_months: int = 6,
@@ -362,3 +383,105 @@ def compute_cointegration_test(
         rows.append({'ticker_a': a, 'ticker_b': b, **stats})
 
     return pd.DataFrame(rows, columns=_COINT_RESULT_COLUMNS)
+
+
+def _full_sample_ols_beta(price_a: pd.Series, price_b: pd.Series) -> float:
+    """
+    Full-sample OLS hedge ratio (price_a ~ const + price_b) — the flat,
+    static-beta baseline used when a caller wants "one number for the
+    whole window" rather than a rolling refit (e.g.
+    utils.plot_pair_diagnostics_dashboard's static_beta_window=None case).
+    Same regression _pair_cointegration_stats already runs internally, just
+    exposed standalone so callers that only want the beta (no cointegration
+    test) don't need to run one.
+    """
+    ols = sm.OLS(price_a, sm.add_constant(price_b)).fit()
+    return float(ols.params.iloc[1])
+
+
+def _rolling_ols_beta(price_a: pd.Series, price_b: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling `window`-day OLS hedge ratio (price_a ~ const + price_b), via
+    statsmodels' RollingOLS — the periodically-refit static-beta
+    counterpart to _kalman_filter_hedge_ratio's continuously-updated
+    beta_t, for visualizing how much the time-varying filter actually buys
+    over a plain rolling regression. Bars before the first full `window`
+    of history come back NaN (RollingOLS's own convention).
+    """
+    exog = sm.add_constant(price_b)
+    fit = RollingOLS(price_a, exog, window=window).fit(params_only=True)
+    return fit.params.iloc[:, 1]
+
+
+def _rolling_pair_correlation(returns_a: pd.Series, returns_b: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling `window`-day Pearson correlation between two daily log-return
+    series — the continuous, single-pair counterpart to
+    _rolling_corr_matrices' periodic full-matrix snapshots, for a per-bar
+    diagnostic line rather than a periodic Stage-A-style recompute.
+    """
+    return returns_a.rolling(window).corr(returns_b)
+
+
+def _rolling_cointegration_stat(
+    price_a: pd.Series, price_b: pd.Series, window: int, stride: int = 5,
+) -> tuple[pd.Series, float]:
+    """
+    Rolling Engle-Granger cointegration test statistic
+    (statsmodels.tsa.stattools.coint) over a trailing `window`-day window,
+    computed only every `stride` days and forward-filled in between.
+
+    Tradeoff, not a silent shortcut: coint() runs an OLS fit plus an ADF
+    test per call, expensive enough that recomputing it on every single bar
+    of a multi-year daily series is wasteful for what is purely a visual
+    diagnostic here — `stride` names that tradeoff explicitly so a caller
+    can dial it to 1 for full resolution if they need it.
+
+    Returns (test-statistic series indexed like price_a/price_b, NaN before
+    the first full window and forward-filled between stride points; the 5%
+    critical value for this window, which — unlike the statistic itself —
+    is constant across every stride point since it depends only on `window`
+    and coint()'s default trend spec, so it's returned once rather than as
+    a series).
+    """
+    idx = price_a.index
+    stat = pd.Series(np.nan, index=idx)
+    crit_5pct = np.nan
+    for i in range(window - 1, len(idx), stride):
+        a_window = price_a.iloc[i - window + 1:i + 1]
+        b_window = price_b.iloc[i - window + 1:i + 1]
+        test_stat, _, crit_values = coint(a_window, b_window)
+        stat.iloc[i] = test_stat
+        crit_5pct = crit_values[1]  # coint()'s crit_value order is [1%, 5%, 10%]
+    return stat.ffill(), crit_5pct
+
+
+def _hurst_exponent(series: np.ndarray, max_lag: int = 20) -> float:
+    """
+    Generalized Hurst exponent via the classic lag-variance method
+    (log-log regression of the standard deviation of lagged differences
+    against the lag) — the standard pairs-trading convention (Ernie Chan),
+    hand-rolled in numpy rather than pulling in the `hurst` package for one
+    small computation (consistent with this package's existing preference,
+    e.g. kalman._kalman_filter_hedge_ratio, for direct numpy over a library
+    dependency for something this size).
+
+    H < 0.5 indicates mean reversion, H = 0.5 a random walk, H > 0.5
+    trending. Not meaningful on a window with near-zero variance (a
+    constant `series` slice would take log(0)) — an inherent limitation of
+    the method, not guarded here since the rolling caller already requires
+    a real spread series.
+    """
+    lags = range(2, max_lag)
+    tau = [np.std(series[lag:] - series[:-lag]) for lag in lags]
+    slope = np.polyfit(np.log(list(lags)), np.log(tau), 1)[0]
+    return slope * 2.0
+
+
+def _rolling_hurst_exponent(series: pd.Series, window: int, max_lag: int = 20) -> pd.Series:
+    """
+    Rolling Hurst exponent of `series` over a trailing `window`-bar window,
+    via _hurst_exponent. Bars before the first full `window` of history
+    come back NaN.
+    """
+    return series.rolling(window).apply(lambda w: _hurst_exponent(w.to_numpy(), max_lag), raw=False)

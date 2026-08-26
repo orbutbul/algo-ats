@@ -53,8 +53,11 @@ def _kalman_filter_hedge_ratio(
     an external OLS estimate — consistent with Stage B not doing so either).
 
     Returns a DataFrame indexed like price_a/price_b, columns
-    ['alpha', 'beta', 'spread', 'spread_var'] (spread_var = the innovation
-    variance S_t at that bar, for a future z-scored entry/exit rule).
+    ['alpha', 'beta', 'spread', 'spread_var', 'beta_var'] (spread_var = the
+    innovation variance S_t at that bar, for a future z-scored entry/exit
+    rule; beta_var = the POST-update state covariance P_t[1,1] -- the
+    filter's own uncertainty about beta_t at that bar, e.g. for plotting a
+    +/-1 std confidence band around beta_t).
     """
     if use_log:
         price_a = np.log(price_a)
@@ -74,6 +77,7 @@ def _kalman_filter_hedge_ratio(
     betas = np.empty(n)
     spreads = np.empty(n)
     spread_vars = np.empty(n)
+    beta_vars = np.empty(n)
 
     for t in range(n):
         # Predict (F = I, random-walk state)
@@ -92,9 +96,13 @@ def _kalman_filter_hedge_ratio(
         betas[t] = x[1]
         spreads[t] = e
         spread_vars[t] = S
+        beta_vars[t] = P[1, 1]
 
     return pd.DataFrame(
-        {'alpha': alphas, 'beta': betas, 'spread': spreads, 'spread_var': spread_vars},
+        {
+            'alpha': alphas, 'beta': betas, 'spread': spreads,
+            'spread_var': spread_vars, 'beta_var': beta_vars,
+        },
         index=price_a.index,
     )
 
@@ -125,8 +133,8 @@ def compute_kalman_hedge_ratio(
     with a data gap would silently jump across it.
 
     Returns _kalman_filter_hedge_ratio's output: a DataFrame indexed by
-    date, columns ['alpha', 'beta', 'spread', 'spread_var']. To get the
-    hedge ratio at a specific time, index into it directly, e.g.
+    date, columns ['alpha', 'beta', 'spread', 'spread_var', 'beta_var']. To
+    get the hedge ratio at a specific time, index into it directly, e.g.
     compute_kalman_hedge_ratio('AAPL', 'MSFT').loc[some_date, 'beta'].
     """
     daily_close = _load_group_daily_closes([ticker_a, ticker_b])
