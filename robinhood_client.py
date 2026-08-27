@@ -30,6 +30,18 @@ CREDENTIALS_PATH = os.path.expanduser(_raw_credentials_path)
 MCP_KEY_PREFIX = "robinhod-trading|"
 TOKEN_ENDPOINT = "https://api.robinhood.com/oauth2/token/"
 
+
+class RobinhoodAuthError(RuntimeError):
+    """
+    Raised for any failure that means the Robinhood MCP connection itself is
+    broken (no credentials on file, expired token with no usable
+    refresh_token, or the server rejecting a request as unauthorized) --
+    distinct from a transient network/API error, so callers (e.g.
+    extraction/ohlcv_robinhood.py) can fire a dedicated "MCP not connected"
+    ntfy alert instead of it reading as a generic data-quality issue.
+    """
+    pass
+
 # The access token Claude Code obtains interactively is short-lived (observed
 # ~5-10 minutes) and is normally kept fresh by Claude Code silently
 # refreshing it during an active session. An unattended run (e.g. this
@@ -84,7 +96,7 @@ def _load_mcp_credentials() -> dict:
     mcp_oauth = creds.get("mcpOAuth", {})
     key = next((k for k in mcp_oauth if k.startswith(MCP_KEY_PREFIX)), None)
     if key is None:
-        raise RuntimeError(
+        raise RobinhoodAuthError(
             "No robinhod-trading MCP credentials found. "
             "Connect it in Claude Code first (the /mcp command)."
         )
@@ -93,7 +105,7 @@ def _load_mcp_credentials() -> dict:
     expires_at_ms = match.get("expiresAt")
     if not expires_at_ms or time.time() * 1000 > expires_at_ms - REFRESH_BUFFER_MS:
         if not match.get("refreshToken"):
-            raise RuntimeError(
+            raise RobinhoodAuthError(
                 "Robinhood MCP access token has expired and no refresh_token "
                 "is on file. Reconnect via `/mcp` in Claude Code, then re-run "
                 "this script."
@@ -101,7 +113,7 @@ def _load_mcp_credentials() -> dict:
         try:
             match = _refresh_access_token(key, match)
         except Exception as e:
-            raise RuntimeError(
+            raise RobinhoodAuthError(
                 "Robinhood MCP access token has expired and refreshing it "
                 f"failed ({e}). Reconnect via `/mcp` in Claude Code, then "
                 "re-run this script."
@@ -148,6 +160,15 @@ class RobinhoodMCPClient:
         resp = requests.post(self.server_url, headers=self._headers(), json=payload, timeout=30)
         if "Mcp-Session-Id" in resp.headers:
             self.session_id = resp.headers["Mcp-Session-Id"]
+        if resp.status_code in (401, 403):
+            # A token can go bad mid-run even though it looked fresh at
+            # client construction (e.g. revoked, scope changed) -- surface
+            # this distinctly from a plain HTTPError so callers can alert on
+            # "MCP not authenticated" rather than a generic request failure.
+            raise RobinhoodAuthError(
+                f"Robinhood MCP rejected the request as unauthorized (HTTP {resp.status_code}). "
+                "Reconnect via `/mcp` in Claude Code, then re-run this script."
+            )
         resp.raise_for_status()
         if not expect_response:
             return None

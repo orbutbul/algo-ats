@@ -53,8 +53,9 @@ import duckdb
 import pandas as pd
 
 from extraction.ohlcv import OHLCV_COLS
-from robinhood_client import RobinhoodMCPClient
+from robinhood_client import RobinhoodAuthError, RobinhoodMCPClient
 from utils import _tracked_symbols
+from validation import send_alert
 
 DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv.duckdb'
 STAGING_TABLE = 'robinhood_1min'
@@ -109,7 +110,9 @@ def _call_historicals(client: RobinhoodMCPClient, symbols: list[str], start: dat
                 text = (result.get('content') or [{}])[0].get('text', 'unknown tool error')
                 raise _ToolError(text)
             return result['structuredContent']
-        except _ToolError:
+        except (_ToolError, RobinhoodAuthError):
+            # Neither is transient -- an auth failure won't fix itself across
+            # a retry/backoff schedule, so surface it immediately.
             raise
         except Exception as e:
             last_err = e
@@ -149,6 +152,23 @@ def _bars_to_frame(payload: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
     return df.set_index(['datetime', 'ticker'])[OHLCV_COLS].sort_index()
+
+
+def _alert_auth_failure(e: RobinhoodAuthError) -> None:
+    """
+    Fire a dedicated ntfy alert for a broken Robinhood MCP connection --
+    distinct from validate_ohlcv()'s generic "no rows" issue, which is what
+    this used to silently degrade to (an auth failure inside a batch's
+    retry loop was swallowed as a per-batch 'FAILED' and the run kept
+    going, so the daily_run alert only ever showed up hours later as
+    robinhood_1min having no rows for the day, with no indication it was
+    an auth problem at all).
+    """
+    send_alert(
+        '[ATS] Robinhood MCP not connected/authenticated',
+        f'extraction.ohlcv_robinhood could not reach Robinhood: {e}\n\n'
+        'Reconnect via `/mcp` in Claude Code, then re-run the pull.',
+    )
 
 
 def _date_chunks(start: date, end: date, chunk_days: int):
@@ -251,7 +271,11 @@ def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None =
     remaining = [t for t in tickers if force or not _is_done(t)]
     print(f'{len(tickers) - len(remaining)}/{len(tickers)} already done at bounds={RH_BOUNDS}, {len(remaining)} remaining')
 
-    client = RobinhoodMCPClient()
+    try:
+        client = RobinhoodMCPClient()
+    except RobinhoodAuthError as e:
+        _alert_auth_failure(e)
+        raise
     con = _connect()
     pending_frames: list[pd.DataFrame] = []
     pending_tickers: list[str] = []
@@ -291,6 +315,14 @@ def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None =
                 payload = _call_historicals(client, batch, chunk_start, chunk_end)
                 chunk_frames.append(_bars_to_frame(payload))
             batch_df = pd.concat(chunk_frames) if chunk_frames else pd.DataFrame()
+        except RobinhoodAuthError as e:
+            # A dead token fails every remaining batch the same way -- flush
+            # what's already been fetched, alert once, and stop instead of
+            # burning through the rest of `remaining` for no benefit.
+            _flush()
+            con.close()
+            _alert_auth_failure(e)
+            raise
         except Exception as e:
             for ticker in batch:
                 progress[ticker] = {
@@ -380,7 +412,11 @@ def download_daily_robinhood(tickers: list[str] | None = None) -> None:
 
     print(f'Pulling {start} .. {end} for {len(tickers)} tickers (bounds={RH_BOUNDS})')
 
-    client = RobinhoodMCPClient()
+    try:
+        client = RobinhoodMCPClient()
+    except RobinhoodAuthError as e:
+        _alert_auth_failure(e)
+        raise
     con = _connect()
     n_ok, n_failed = 0, 0
 
@@ -394,6 +430,14 @@ def download_daily_robinhood(tickers: list[str] | None = None) -> None:
                 for chunk_start, chunk_end in _date_chunks(start, end, RH_CHUNK_DAYS)
             ]
             batch_df = pd.concat(chunk_frames) if chunk_frames else pd.DataFrame()
+        except RobinhoodAuthError as e:
+            # A dead token fails every remaining batch the same way. Stop
+            # here without writing _write_last_run(end) below -- advancing
+            # the marker on a run that fetched nothing would make the next
+            # (fixed) run skip straight past today instead of backfilling it.
+            con.close()
+            _alert_auth_failure(e)
+            raise
         except Exception as e:
             print(f'[batch {batch_num}/{n_batches}] {batch}: FAILED -- {e}')
             n_failed += len(batch)
