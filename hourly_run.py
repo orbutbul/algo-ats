@@ -1,9 +1,11 @@
 """
 hourly_run.py — scheduled via Windows Task Scheduler, hourly.
 
-Runs:
+Runs, independently of one another:
   1. WSB widget data (mentions, sentiment, leaderboard, holdings, trades) —
      appended as one snapshot per UTC hour, building an intraday history.
+  2. Benzinga news (headlines/teasers, incrementally fetched since the last
+     successful run).
 """
 
 import logging
@@ -22,7 +24,8 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
 from extraction.wsb import get_latest_wsb_data, save_wsb_data
-from validation import validate_wsb, send_alert
+from extraction.news import download_news
+from validation import validate_wsb, validate_news, send_alert
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,6 +63,19 @@ def run():
         issues.append('WSB scrape/save failed')
     else:
         issues += validate_wsb(run_date=start.date(), run_hour=start.hour)
+
+    # ------------------------------------------------------------------
+    # 2. Benzinga news
+    # ------------------------------------------------------------------
+    log.info('--- Benzinga news ---')
+    try:
+        news_df = download_news()
+        log.info('Benzinga news: fetched %d new articles', len(news_df))
+    except Exception:
+        log.error(traceback.format_exc())
+        issues.append('Benzinga news fetch/save failed')
+    else:
+        issues += validate_news(run_date=start.date())
 
     if issues:
         log.warning('Validation issues: %s', '; '.join(issues))

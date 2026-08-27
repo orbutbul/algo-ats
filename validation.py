@@ -26,6 +26,7 @@ load_dotenv()
 
 from extraction.fundamentals import FUNDAMENTALS_DIR, FUNDAMENTALS_SPECS
 from extraction.wsb import WSB_DB_PATH
+from extraction.news import NEWS_DB_PATH
 
 OHLCV_DUCKDB_PATH = Path('data/ohlcv.duckdb')
 OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'
@@ -180,3 +181,32 @@ def validate_wsb(run_date: date | None = None, run_hour: int | None = None) -> l
     finally:
         con.close()
     return issues
+
+
+def validate_news(run_date: date | None = None) -> list[str]:
+    """Checks data/news.duckdb for signs the Benzinga collector has stalled
+    (e.g. an expired API key or a changed endpoint). Not market-day-gated —
+    news can flow on weekends/holidays too."""
+    run_date = run_date or datetime.now(timezone.utc).date()
+
+    if not NEWS_DB_PATH.exists():
+        return [f'{NEWS_DB_PATH} does not exist']
+
+    con = duckdb.connect(str(NEWS_DB_PATH), read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if 'benzinga_news' not in tables:
+            return ['benzinga_news table does not exist']
+
+        latest = con.execute('SELECT max(created_utc) FROM benzinga_news').fetchone()[0]
+    finally:
+        con.close()
+
+    if latest is None:
+        return ['benzinga_news: no rows found']
+
+    latest_utc = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - latest_utc
+    if age > pd.Timedelta(hours=3):
+        return [f'benzinga_news: latest article is {age} old (possible stalled collector or expired key)']
+    return []
