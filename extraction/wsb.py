@@ -125,6 +125,33 @@ def _click_sentiment_toggle(frame: Frame) -> bool:
     return False
 
 
+def _wait_for_body_markers(
+    frame: Frame, markers: list[str], timeout_ms: int = 8_000, poll_ms: int = 400,
+) -> str:
+    """
+    Poll frame.inner_text("body") until it contains one of `markers` (any
+    string that only appears once the panel has actually finished its async
+    load — a real data row header, or the widget's own "no data" message) or
+    `timeout_ms` elapses. Returns whatever text is there when we stop.
+
+    Needed because the Data > Portfolio / Data > Sentiment sub-tabs fetch
+    their content asynchronously after the tab click resolves -- a fixed
+    wait_for_timeout() was intermittently capturing the panel mid-load
+    (before Reddit's backend had responded), producing spurious 0-row
+    mentions_v2/positions_v2 snapshots even though the data was there a
+    second later.
+    """
+    elapsed = 0
+    text = frame.inner_text("body")
+    while elapsed < timeout_ms:
+        if any(m in text for m in markers):
+            return text
+        frame.page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+        text = frame.inner_text("body")
+    return text
+
+
 def _capture_widget_views(post_url: str) -> dict[str, str]:
     """
     Render a verified-trader post and capture the Devvit widget's plain
@@ -188,11 +215,13 @@ def _capture_widget_views(post_url: str) -> dict[str, str]:
             views["portfolio"] = ""
             views["mentions_v2"] = ""
             if _click_visible_text(frame, "Data"):
-                page.wait_for_timeout(1_500)
-                views["portfolio"] = frame.inner_text("body")
+                views["portfolio"] = _wait_for_body_markers(
+                    frame, ["Δ", "No positions data available"],
+                )
                 if _click_visible_text(frame, "Sentiment"):
-                    page.wait_for_timeout(1_500)
-                    views["mentions_v2"] = frame.inner_text("body")
+                    views["mentions_v2"] = _wait_for_body_markers(
+                        frame, ["Score", "No sentiment data available"],
+                    )
 
             return views
         finally:
