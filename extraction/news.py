@@ -107,14 +107,26 @@ def _fetch_page(token: str, updated_since: int, page: int) -> list[dict]:
     }
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.get(BENZINGA_NEWS_URL, params=params, timeout=15)
+            resp = requests.get(
+                BENZINGA_NEWS_URL, params=params,
+                headers={'Accept': 'application/json'}, timeout=15,
+            )
             if resp.status_code == 200:
-                return resp.json() or []
+                try:
+                    return resp.json() or []
+                except ValueError:
+                    print(
+                        f'  Benzinga returned 200 but an unparseable body '
+                        f'(Content-Type: {resp.headers.get("Content-Type")}): '
+                        f'{resp.text[:500]!r}'
+                    )
+                    raise
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = 2 ** attempt
                 print(f'  Benzinga returned {resp.status_code}, retrying in {wait}s...')
                 time.sleep(wait)
                 continue
+            print(f'  Benzinga returned {resp.status_code}: {resp.text[:500]!r}')
             resp.raise_for_status()
         except requests.RequestException as e:
             if attempt == MAX_RETRIES - 1:
