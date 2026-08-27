@@ -28,6 +28,53 @@ if not _raw_credentials_path:
     raise RuntimeError("CLAUDE_CREDENTIALS_PATH is not set (check your .env file)")
 CREDENTIALS_PATH = os.path.expanduser(_raw_credentials_path)
 MCP_KEY_PREFIX = "robinhod-trading|"
+TOKEN_ENDPOINT = "https://api.robinhood.com/oauth2/token/"
+
+# The access token Claude Code obtains interactively is short-lived (observed
+# ~5-10 minutes) and is normally kept fresh by Claude Code silently
+# refreshing it during an active session. An unattended run (e.g. this
+# module invoked from the Airflow daily_run DAG) has no such session
+# refreshing it in the background, so by the time a scheduled job fires the
+# cached token is routinely already dead -- refresh proactively here instead
+# of just failing, using the long-lived refresh_token stored alongside it.
+REFRESH_BUFFER_MS = 5 * 60 * 1000
+
+
+def _refresh_access_token(key: str, match: dict) -> dict:
+    """
+    Exchanges match['refreshToken'] for a new access token via the
+    standard OAuth refresh_token grant (public client, no secret --
+    token_endpoint_auth_methods_supported is 'none' per the server's
+    discovery metadata) and persists the result back into
+    CREDENTIALS_PATH so Claude Code and any other consumer pick up the
+    same refreshed token instead of it silently going stale.
+    """
+    resp = requests.post(
+        TOKEN_ENDPOINT,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": match["refreshToken"],
+            "client_id": match["clientId"],
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    match = {
+        **match,
+        "accessToken": payload["access_token"],
+        "refreshToken": payload.get("refresh_token", match["refreshToken"]),
+        "expiresAt": time.time() * 1000 + payload["expires_in"] * 1000,
+    }
+
+    with open(CREDENTIALS_PATH, "r") as f:
+        creds = json.load(f)
+    creds.setdefault("mcpOAuth", {})[key] = match
+    with open(CREDENTIALS_PATH, "w") as f:
+        json.dump(creds, f, indent=2)
+
+    return match
 
 
 def _load_mcp_credentials() -> dict:
@@ -35,19 +82,30 @@ def _load_mcp_credentials() -> dict:
         creds = json.load(f)
 
     mcp_oauth = creds.get("mcpOAuth", {})
-    match = next((v for k, v in mcp_oauth.items() if k.startswith(MCP_KEY_PREFIX)), None)
-    if match is None:
+    key = next((k for k in mcp_oauth if k.startswith(MCP_KEY_PREFIX)), None)
+    if key is None:
         raise RuntimeError(
             "No robinhod-trading MCP credentials found. "
             "Connect it in Claude Code first (the /mcp command)."
         )
+    match = mcp_oauth[key]
 
     expires_at_ms = match.get("expiresAt")
-    if expires_at_ms and time.time() * 1000 > expires_at_ms:
-        raise RuntimeError(
-            "Robinhood MCP access token has expired. "
-            "Reconnect via `/mcp` in Claude Code, then re-run this script."
-        )
+    if not expires_at_ms or time.time() * 1000 > expires_at_ms - REFRESH_BUFFER_MS:
+        if not match.get("refreshToken"):
+            raise RuntimeError(
+                "Robinhood MCP access token has expired and no refresh_token "
+                "is on file. Reconnect via `/mcp` in Claude Code, then re-run "
+                "this script."
+            )
+        try:
+            match = _refresh_access_token(key, match)
+        except Exception as e:
+            raise RuntimeError(
+                "Robinhood MCP access token has expired and refreshing it "
+                f"failed ({e}). Reconnect via `/mcp` in Claude Code, then "
+                "re-run this script."
+            ) from e
 
     return match
 
