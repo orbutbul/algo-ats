@@ -1,5 +1,5 @@
 """
-scripts/oracle_provision.py — retries creating an Oracle Always Free compute
+oracle_cloud/oracle_provision.py — retries creating an Oracle Always Free compute
 instance until capacity is available, cycling through every availability
 domain in the region each pass. "Out of host capacity" is the one error
 this script treats as retryable (alongside 429 rate-limiting, backed off
@@ -29,7 +29,7 @@ You'll also need, from the OCI console:
                         you'll SSH in with
 
 Usage:
-    python scripts/oracle_provision.py \\
+    python oracle_cloud/oracle_provision.py \\
         --compartment-id ocid1.tenancy.oc1..xxx \\
         --subnet-id ocid1.subnet.oc1..xxx \\
         --ssh-key-file ~/.ssh/ats_trading.pub

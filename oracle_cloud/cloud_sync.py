@@ -1,9 +1,9 @@
 """
-scripts/cloud_sync.py — pull the Oracle Cloud VM's accumulated pipeline data
+oracle_cloud/cloud_sync.py — pull the Oracle Cloud VM's accumulated pipeline data
 into local data/*.duckdb, verify the merge, then wipe the cloud copy.
 
 Run manually, whenever you want a sync (no daemon/listener on either end):
-    python scripts/cloud_sync.py --host <public-ip> --key /path/to/private_key
+    python oracle_cloud/cloud_sync.py --host <public-ip> --key /path/to/private_key
 
 The VM is treated as a lean, ephemeral buffer: local data/*.duckdb is the
 permanent store and always grows; the VM's copies only ever hold one sync
@@ -18,11 +18,17 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
 
-from extraction.news import _TABLES as NEWS_TABLES
+# Running this as `python oracle_cloud/cloud_sync.py` only puts this file's
+# own directory on sys.path, not the repo root -- needed for the
+# extraction.news import below (and so DATA_DIR/TMP_DIR below resolve
+# relative to wherever this is invoked from, run this from the repo root).
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from extraction.news import _TABLES as NEWS_TABLES  # noqa: E402
 
 DATA_DIR = Path('data')
 TMP_DIR = DATA_DIR / '.cloud_sync_tmp'
@@ -134,12 +140,12 @@ def wipe(host: str, key: str, user: str, port: int, docker: bool) -> None:
         remote_cmd = (
             f'cd {REMOTE_REPO_DIR} && '
             f'docker compose -f airflow/docker-compose.yaml exec -T airflow-scheduler '
-            f'python scripts/remote_wipe.py {db_names}'
+            f'python oracle_cloud/remote_wipe.py {db_names}'
         )
     else:
         # E2.1.Micro + native venv/cron deploy path (default) -- no
         # containers, just the venv's python directly. See DEPLOY.md.
-        remote_cmd = f'cd {REMOTE_REPO_DIR} && venv/bin/python scripts/remote_wipe.py {db_names}'
+        remote_cmd = f'cd {REMOTE_REPO_DIR} && venv/bin/python oracle_cloud/remote_wipe.py {db_names}'
     _run(['ssh', '-i', key, '-p', str(port), f'{user}@{host}', remote_cmd])
 
 

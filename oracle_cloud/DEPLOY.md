@@ -52,13 +52,13 @@ registration in 2026). `wsb_run.py` (repo root) runs it locally on a schedule in
    **If you hit "Out of host capacity"** (mainly an A1.Flex problem — E2.1.Micro is essentially
    always available): this is a well-known, widely-reported Always Free A1 issue — the free
    Ampere pool is oversubscribed in many regions, with no published ETA for when it frees up.
-   Rather than clicking Create repeatedly by hand, use `scripts/oracle_provision.py`:
+   Rather than clicking Create repeatedly by hand, use `oracle_cloud/oracle_provision.py`:
    ```
    pip install oci
    oci setup config    # one-time: generates an API key pair, writes ~/.oci/config --
                         # upload the printed public key under Identity -> My Profile -> API Keys
 
-   python scripts/oracle_provision.py \
+   python oracle_cloud/oracle_provision.py \
      --compartment-id <tenancy or compartment OCID> \
      --subnet-id <public subnet-ats-trading-vcn OCID> \
      --ssh-key-file ~/.ssh/ats_trading.pub
@@ -95,11 +95,11 @@ registration in 2026). `wsb_run.py` (repo root) runs it locally on a schedule in
    ```
    cd ~/ATS_trading
    python3.12 -m venv venv
-   venv/bin/pip install -r requirements.txt
+   venv/bin/pip install -r oracle_cloud/requirements.txt
    ```
-   Uses the root `requirements.txt`, not `airflow/requirements.txt` — same dependency list minus
-   `vectorbtpro`. The core pipeline doesn't need it: `extraction/ohlcv.py`'s crypto fetch was
-   ported from vectorbtpro's `BinanceData` wrapper to plain `python-binance` (already a
+   Uses `oracle_cloud/requirements.txt`, not `airflow/requirements.txt` — same dependency list
+   minus `vectorbtpro`. The core pipeline doesn't need it: `extraction/ohlcv.py`'s crypto fetch
+   was ported from vectorbtpro's `BinanceData` wrapper to plain `python-binance` (already a
    dependency) specifically so this deploy needs no private-repo GitHub PAT at all.
 4. **(Optional) Install Playwright's Chromium browser.** `playwright` itself must be installed
    (already covered by step 3 — `validation.py` imports `extraction/wsb.py` at module level,
@@ -137,12 +137,12 @@ registration in 2026). `wsb_run.py` (repo root) runs it locally on a schedule in
 
 ## 3. Sync and wipe (run whenever you want, from your local machine)
 
-`scripts/cloud_sync.py` pulls the cloud's accumulated data into your local `data/*.duckdb`
+`oracle_cloud/cloud_sync.py` pulls the cloud's accumulated data into your local `data/*.duckdb`
 files, verifies the merge, then wipes the cloud copy — keeping the cloud VM lean indefinitely
 regardless of sync cadence, while local history only ever grows.
 
 ```
-python scripts/cloud_sync.py --host <public-ip> --key /path/to/private_key
+python oracle_cloud/cloud_sync.py --host <public-ip> --key /path/to/private_key
 ```
 
 (Add `--docker` only if you're syncing against the A1 + Docker/Airflow path from §4 instead —
@@ -159,7 +159,7 @@ What it does, in order (`data/wsb.duckdb` isn't part of this — WSB never runs 
 3. **Verify**: compares pulled vs. now-present-locally row counts per table; aborts before
    wiping anything if they don't reconcile.
 4. **Wipe**: only after a verified merge, deletes the data *tables* on the VM (not the whole
-   files) via SSH (`venv/bin/python scripts/remote_wipe.py ...`, or the Docker exec equivalent
+   files) via SSH (`venv/bin/python oracle_cloud/remote_wipe.py ...`, or the Docker exec equivalent
    with `--docker`). It explicitly leaves `ohlcv_robinhood_last_run.txt`,
    `ohlcv_robinhood_progress.json`, `ohlcv_last_run.txt`, and `news_last_run.txt` untouched, so
    the cloud pipeline's incremental fetchers resume from where they left off instead of

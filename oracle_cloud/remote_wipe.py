@@ -1,10 +1,10 @@
 """
-scripts/remote_wipe.py — deletes all rows from every table in the given
+oracle_cloud/remote_wipe.py — deletes all rows from every table in the given
 data/*.duckdb file(s), leaving the schema and the incremental-fetch
 bookkeeping files (*_last_run.txt, *_progress.json -- plain files, outside
 these databases, untouched by this script regardless) intact.
 
-Runs on the Oracle Cloud VM only, invoked by scripts/cloud_sync.py (local
+Runs on the Oracle Cloud VM only, invoked by oracle_cloud/cloud_sync.py (local
 machine) over SSH after it has verified every row from these files was
 pulled and merged into the local data/*.duckdb copies. Never run this
 directly unless you're sure the data has already been copied out -- it does
@@ -17,7 +17,7 @@ hardcoded list would silently drift out of sync with the real schemas
 defined in extraction/wsb.py::_TABLES, extraction/news.py::_TABLES, etc.
 
 Usage (inside the airflow-scheduler container):
-    python scripts/remote_wipe.py wsb news ohlcv
+    python oracle_cloud/remote_wipe.py wsb news ohlcv
 """
 
 from __future__ import annotations
