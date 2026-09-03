@@ -207,6 +207,14 @@ def validate_news(run_date: date | None = None) -> list[str]:
 
     latest_utc = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
     age = datetime.now(timezone.utc) - latest_utc
-    if age > pd.Timedelta(hours=3):
+    # Benzinga's free "Basic Financial News" tier is low-volume and bursty --
+    # ~25 articles/24h observed, clustered around US trading hours -- so an
+    # hourly collector run can easily see zero new articles for several
+    # consecutive hours overnight with nothing actually wrong. A 3h threshold
+    # false-alarmed on this routinely (confirmed via cron.log: 8 straight
+    # hourly runs with 0 new articles overnight, all genuine quiet period, no
+    # errors). 12h still catches a genuinely dead collector/expired key well
+    # within a day.
+    if age > pd.Timedelta(hours=12):
         return [f'benzinga_news: latest article is {age} old (possible stalled collector or expired key)']
     return []
