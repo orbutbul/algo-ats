@@ -292,8 +292,17 @@ def _fetch_fields(tickers: list[str], fields: list[str], delay: float = 0.5, ret
     if not rows:
         return pd.DataFrame(columns=fields)
     df = pd.DataFrame(rows).set_index('ticker')
-    # Coerce numeric columns and replace inf (e.g. trailingPE on loss-making stocks)
-    df = df.apply(pd.to_numeric, errors='ignore')
+    # Coerce numeric columns and replace inf (e.g. trailingPE on loss-making stocks).
+    # pd.to_numeric's errors='ignore' was deprecated in pandas 2.x and removed
+    # outright in pandas 3.0 (raises ValueError instead of passing the column
+    # through unchanged) -- this replicates the old per-column "leave it alone
+    # if it doesn't convert" behavior explicitly, working on both.
+    def _to_numeric_or_unchanged(col):
+        try:
+            return pd.to_numeric(col)
+        except (ValueError, TypeError):
+            return col
+    df = df.apply(_to_numeric_or_unchanged)
     df = df.replace([float('inf'), float('-inf')], float('nan'))
     return df
 
