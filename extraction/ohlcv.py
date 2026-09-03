@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from vectorbtpro import *
 from tradingview_screener import Query, col
 import pandas_market_calendars as mcal
 import re
@@ -18,6 +17,8 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, Adjustment
+from binance.client import Client as BinanceClient
+from concurrent.futures import ThreadPoolExecutor
 from utils import *
 
 load_dotenv()
@@ -100,10 +101,32 @@ def _fetch_alpaca_bars(symbols: list[str], start: datetime, end: datetime):
     return None
 
 
+def _fetch_binance_klines(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """1-min klines for one Binance.US symbol from `start` to `end`, as a
+    DataFrame indexed by UTC datetime with lowercase OHLCV_COLS columns.
+    A fresh client per call is cheap (klines is an unauthenticated public
+    endpoint, same as BinanceClient(tld='us') usage elsewhere in this repo)
+    and keeps concurrent calls from sharing state."""
+    client = BinanceClient(tld='us')
+    klines = client.get_historical_klines(
+        symbol, BinanceClient.KLINE_INTERVAL_1MINUTE,
+        start.strftime('%d %b %Y %H:%M:%S'), end.strftime('%d %b %Y %H:%M:%S'),
+    )
+    if not klines:
+        return pd.DataFrame(columns=OHLCV_COLS).rename_axis('datetime')
+    df = pd.DataFrame(klines, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'num_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore',
+    ])
+    df['datetime'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+    return df.set_index('datetime')[OHLCV_COLS].astype(float)
+
+
 def download_daily_1min(equity_symbols, crypto_symbols):
     """
     Downloads 1-minute OHLCV bars and appends them to OHLCV_PATH.
-    Equities and ETFs are fetched via Alpaca; cryptos via Binance (vectorbtpro).
+    Equities and ETFs are fetched via Alpaca; cryptos via Binance (python-binance).
     Deduplicates on (datetime, ticker) so re-running the same day is safe.
 
     If the last successful pull was more than 24h ago (e.g. the machine was off),
@@ -130,22 +153,19 @@ def download_daily_1min(equity_symbols, crypto_symbols):
         batch_df = raw.rename_axis(['ticker', 'datetime']).swaplevel().sort_index()
         frames.append(batch_df[OHLCV_COLS])
 
-    # Binance US crypto data via vectorbtpro — fetched concurrently since
-    # Binance pages each symbol sequentially otherwise (~5 min/symbol for a
-    # full year of 1-min bars), which dominates runtime when backfilling.
+    # Binance US crypto data via python-binance directly (previously
+    # vectorbtpro's BinanceData wrapper -- removed so this module doesn't
+    # require a private-repo GitHub PAT just to build/deploy; python-binance
+    # is already a project dependency, used the same way in
+    # utils.py::screen_symbols). Fetched concurrently since Binance pages
+    # each symbol sequentially otherwise (~5 min/symbol for a full year of
+    # 1-min bars), which dominates runtime when backfilling.
     if crypto_symbols:
-        vbt.BinanceData.set_custom_settings(client_config=dict(tld="us"))
-        crypto_data = vbt.BinanceData.pull(
-            crypto_symbols,
-            start=start,
-            timeframe='1m',
-            execute_kwargs=dict(engine='threadpool', engine_config=dict(init_kwargs=dict(max_workers=min(len(crypto_symbols), 30)))),
-            show_progress=False,
-        )
-        # vbt returns {ticker: df}; concat gives (ticker, datetime) — swap to match equities index order
-        crypto_df = pd.concat(crypto_data.data).rename_axis(['ticker', 'datetime'])
+        with ThreadPoolExecutor(max_workers=min(len(crypto_symbols), 30)) as ex:
+            crypto_data = dict(zip(crypto_symbols, ex.map(lambda s: _fetch_binance_klines(s, start, now), crypto_symbols)))
+        # concat gives (ticker, datetime) — swap to match equities index order
+        crypto_df = pd.concat(crypto_data, names=['ticker'])
         crypto_df = crypto_df.swaplevel().sort_index()
-        crypto_df.columns = crypto_df.columns.str.lower()
         crypto_df = crypto_df[OHLCV_COLS]
         frames.append(crypto_df)
 

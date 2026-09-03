@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone
 import time
 from pathlib import Path
-from vectorbtpro import *
 from tradingview_screener import Query, col
 import pandas_market_calendars as mcal
 import re

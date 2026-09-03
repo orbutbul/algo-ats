@@ -1,12 +1,12 @@
 import yfinance as yf
 from yfinance import EquityQuery
+import numpy as np
 import pandas as pd
 import requests
 import json
 from datetime import datetime, timezone
 import time
 from pathlib import Path
-from vectorbtpro import *
 from tradingview_screener import Query, col
 from binance.client import Client as BinanceClient
 import pandas_market_calendars as mcal
@@ -230,6 +230,12 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
         }
 
     if asvbt:
+        # Deliberately imported here rather than at module level: vectorbtpro
+        # is a private-repo dependency not needed by the core pipeline (see
+        # extraction/ohlcv.py's crypto fetch, which used to depend on it too)
+        # -- only this optional research/dashboard code path needs it, so it
+        # shouldn't force every caller of get_data_duckdb to have it installed.
+        import vectorbtpro as vbt
         return vbt.Data.from_data(per_ticker)
 
     if not asdf:
