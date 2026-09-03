@@ -1,12 +1,11 @@
 """
-hourly_run.py — scheduled hourly on the cloud VM (cron; see DEPLOY.md).
-
-Runs Benzinga news (headlines/teasers, incrementally fetched since the last
-successful run).
-
-WSB widget data runs separately, on your LOCAL machine, via wsb_run.py — see
-that file's docstring for why (Reddit network-blocks the scraper from cloud
-datacenter IPs).
+wsb_run.py — scheduled hourly on your LOCAL machine (Windows Task Scheduler),
+NOT on the cloud VM. Reddit network-blocks anonymous requests from cloud
+datacenter IPs (Oracle/AWS/GCP), confirmed via a 403 "You've been blocked by
+network security" response when this scraper ran from the Oracle Cloud VM —
+so WSB widget data (mentions, sentiment, leaderboard, holdings, trades)
+stays local, while hourly_run.py (Benzinga news) and daily_run.py run on the
+cloud VM instead. See DEPLOY.md.
 """
 
 import logging
@@ -24,12 +23,12 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
-from extraction.news import download_news
-from validation import validate_news, send_alert
+from extraction.wsb import get_latest_wsb_data, save_wsb_data
+from validation import validate_wsb, send_alert
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_PATH = LOG_DIR / 'hourly_run.log'
+LOG_PATH = LOG_DIR / 'wsb_run.log'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,33 +39,33 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-log = logging.getLogger('hourly_run')
+log = logging.getLogger('wsb_run')
 
 
 def run():
     start = datetime.now(timezone.utc)
     log.info('=' * 55)
-    log.info('Hourly run started: %s', start.strftime('%Y-%m-%d %H:%M:%S'))
+    log.info('WSB run started: %s', start.strftime('%Y-%m-%d %H:%M:%S'))
     log.info('=' * 55)
 
-    log.info('--- Benzinga news ---')
     issues = []
     try:
-        news_df = download_news()
-        log.info('Benzinga news: fetched %d new articles', len(news_df))
+        wsb_data = get_latest_wsb_data(post_type='moves')
+        save_wsb_data(wsb_data)
+        log.info('WSB data saved successfully')
     except Exception:
         log.error(traceback.format_exc())
-        issues.append('Benzinga news fetch/save failed')
+        issues.append('WSB scrape/save failed')
     else:
-        issues += validate_news(run_date=start.date())
+        issues += validate_wsb(run_date=start.date(), run_hour=start.hour)
 
     if issues:
         log.warning('Validation issues: %s', '; '.join(issues))
-        send_alert(f'[ATS] hourly_run issues ({start.strftime("%Y-%m-%d %H:00")} UTC)', '\n'.join(issues))
+        send_alert(f'[ATS] wsb_run issues ({start.strftime("%Y-%m-%d %H:00")} UTC)', '\n'.join(issues))
 
     elapsed = (datetime.now(timezone.utc) - start).seconds
     log.info('=' * 55)
-    log.info('Hourly run finished in %ds', elapsed)
+    log.info('WSB run finished in %ds', elapsed)
     log.info('=' * 55)
 
 
