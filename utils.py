@@ -244,6 +244,56 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
     return pd.concat(per_ticker, names=['ticker']).swaplevel().sort_index()
 
 
+def get_merged_close(tickers=None, start=None, end=None) -> pd.DataFrame:
+    """
+    Stitches data/ohlcv.duckdb::massive_1min (the Massive equities/ETF
+    backfill, 2024-07-23 -> 2026-07-23) and ::robinhood_1min (the daily
+    incremental pull, 2026-07-22 onward) into one close-price matrix:
+    index=datetime, columns=ticker, values=close.
+
+    Robinhood wins on the one-day overlap between the two tables (it's the
+    fresher/more-recently-verified source for that window) -- done via
+    ROW_NUMBER() partitioned on (datetime, ticker) rather than a plain
+    UNION, which would silently duplicate rows for that overlap.
+
+    tickers/start/end filters are pushed into SQL, same as get_data_duckdb.
+    Omitting tickers pulls the full ~2,300-symbol universe across the whole
+    history, which is a very wide/tall pivot -- scope down with `tickers`
+    or a `start` cutoff for interactive use.
+    """
+    tickers = [tickers] if isinstance(tickers, str) else tickers
+    where_clause, where_params = _ohlcv_where_clause(tickers, start, end)
+    params = where_params + where_params
+
+    query = f'''
+        WITH combined AS (
+            SELECT datetime, ticker, close, 1 AS source_priority
+            FROM robinhood_1min
+            {where_clause}
+            UNION ALL
+            SELECT datetime, ticker, close, 0 AS source_priority
+            FROM massive_1min
+            {where_clause}
+        ),
+        deduped AS (
+            SELECT datetime, ticker, close,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY datetime, ticker ORDER BY source_priority DESC
+                   ) AS rn
+            FROM combined
+        )
+        SELECT datetime, ticker, close FROM deduped WHERE rn = 1 ORDER BY datetime
+    '''
+
+    con = _connect_ohlcv_duckdb()
+    try:
+        df = con.execute(query, params).df()
+    finally:
+        con.close()
+
+    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+    return df.pivot(index='datetime', columns='ticker', values='close').sort_index()
+
 
 def _tracked_symbols() -> dict:
     """
