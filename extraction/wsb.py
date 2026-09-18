@@ -113,6 +113,24 @@ def _click_visible_text(frame: Frame, label: str) -> bool:
     return False
 
 
+def _click_visible_text_retry(
+    frame: Frame, label: str, attempts: int = 4, poll_ms: int = 400,
+) -> bool:
+    """
+    Retry `_click_visible_text` a few times before giving up. The sub-tab
+    button (e.g. "Sentiment") can still be mid-render — no bounding box yet —
+    right after its parent tab's own panel finishes loading, so a single
+    immediate attempt can miss it even though the button appears a moment
+    later. Used for clicks whose failure must not be silently swallowed
+    (unlike the best-effort legacy toggles above).
+    """
+    for attempt in range(attempts):
+        if _click_visible_text(frame, label):
+            return True
+        frame.page.wait_for_timeout(poll_ms)
+    return False
+
+
 def _click_sentiment_toggle(frame: Frame) -> bool:
     """Click the 'NN% Bear'/'NN% Bull' button to flip the sentiment panel."""
     for b in frame.query_selector_all("button"):
@@ -145,6 +163,39 @@ def _wait_for_body_markers(
     text = frame.inner_text("body")
     while elapsed < timeout_ms:
         if any(m in text for m in markers):
+            return text
+        frame.page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+        text = frame.inner_text("body")
+    return text
+
+
+def _wait_for_rows_or_empty(
+    frame: Frame,
+    header: str,
+    cols: int,
+    empty_markers: list[str],
+    timeout_ms: int = 8_000,
+    poll_ms: int = 400,
+) -> str:
+    """
+    Like `_wait_for_body_markers`, but for panels backed by a header + row
+    table (Data > Portfolio / Data > Sentiment). The plain header-text check
+    is too weak: the widget keeps a hidden mobile-layout duplicate of every
+    panel in the DOM, so `header` (e.g. "Score") can appear in the body text
+    before the real panel's rows have actually rendered, causing the caller
+    to capture the header with zero data rows after it (a spurious 0-row
+    snapshot). Instead, poll until `header` is followed by at least `cols`
+    values (one full row), or one of `empty_markers` (the widget's own
+    "no data" message) appears, or `timeout_ms` elapses.
+    """
+    elapsed = 0
+    text = frame.inner_text("body")
+    while elapsed < timeout_ms:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if any(m in text for m in empty_markers):
+            return text
+        if _rows_after_marker(lines, header, cols):
             return text
         frame.page.wait_for_timeout(poll_ms)
         elapsed += poll_ms
@@ -214,14 +265,24 @@ def _capture_widget_views(post_url: str) -> dict[str, str]:
 
             views["portfolio"] = ""
             views["mentions_v2"] = ""
-            if _click_visible_text(frame, "Data"):
-                views["portfolio"] = _wait_for_body_markers(
-                    frame, ["Δ", "No positions data available"],
+            if _click_visible_text_retry(frame, "Data"):
+                views["portfolio"] = _wait_for_rows_or_empty(
+                    frame, "Δ", cols=10, empty_markers=["No positions data available"],
                 )
-                if _click_visible_text(frame, "Sentiment"):
-                    views["mentions_v2"] = _wait_for_body_markers(
-                        frame, ["Score", "No sentiment data available"],
+                if _click_visible_text_retry(frame, "Sentiment"):
+                    views["mentions_v2"] = _wait_for_rows_or_empty(
+                        frame, "Score", cols=6, empty_markers=["No sentiment data available"],
                     )
+                else:
+                    print(
+                        f"wsb: could not click Sentiment sub-tab on {post_url}; "
+                        "mentions_v2 will be empty for this run"
+                    )
+            else:
+                print(
+                    f"wsb: could not click Data tab on {post_url}; "
+                    "positions_v2/mentions_v2 will be empty for this run"
+                )
 
             return views
         finally:
