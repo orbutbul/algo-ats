@@ -30,3 +30,4 @@ python-dotenv>=1.2.2
 vadersentiment>=3.3.2
 tqdm
 python-binance==1.0.36
+pyarrow>=17.0.0
