@@ -23,6 +23,7 @@ dependencies = [
     "prawcore>=2.4.0",
     "python-dotenv>=1.2.2",
     "pytrends>=4.9.2",
+    "requests>=2.34.0",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
@@ -38,8 +39,9 @@ vectorbtpro = { git = "https://github.com/polakowo/vectorbt.pro.git", rev = "v20
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "requests-mock>=1.12.1",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["regime/tests"]
+testpaths = ["regime/tests", "prediction_markets/tests"]
