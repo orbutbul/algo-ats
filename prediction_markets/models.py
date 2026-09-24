@@ -10,12 +10,19 @@ Prices are always a float in [0, 1] (probability / dollars-per-$1-contract
 either way, since every venue here is a binary or per-outcome market paying
 $1 on the winning side). Timestamps are always timezone-aware UTC
 `pandas.Timestamp`/`datetime`.
+
+Sports game markets additionally carry a venue-agnostic description of the
+proposition their YES/long side pays on (league, game, market_type, outcome,
+line, negated) so prediction_markets/matching.py can pair equivalent bets
+across venues without knowing either venue's ticker/slug grammar. Those
+fields stay None for anything a client doesn't recognize as a full-game
+winner/spread/total market.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -34,6 +41,21 @@ class Market:
     close_time: datetime | None = None
     volume: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)   # untouched venue payload, for anything not normalized
+    best_bid: float | None = None         # top-of-book for the same outcome as last_price, from the list payload
+    best_ask: float | None = None         # (None where the venue's list payload doesn't carry quotes)
+
+    # --- sports game markets only (None otherwise) ---------------------------
+    # The YES/long side pays iff the proposition below is true (or false, if
+    # `negated`). Propositions: 'winner' -> `outcome` wins; 'spread' ->
+    # `outcome` wins by more than `line`; 'total' -> combined score > `line`.
+    league: str | None = None             # 'nfl', 'cfb', 'mlb', 'nba', 'wnba', 'nhl', 'ufc'
+    game_id: str | None = None            # venue-native id shared by every market on the same game
+    event_date: date | None = None        # scheduled game date (US Eastern calendar date on both venues)
+    market_type: str | None = None        # 'winner' | 'spread' | 'total'
+    outcome: str | None = None            # venue-native team/fighter code the proposition is about
+    line: float | None = None             # spread margin (always > 0) or total threshold
+    negated: bool = False                 # YES/long pays when the proposition is FALSE
+    teams: dict[str, tuple[str, ...]] = field(default_factory=dict)   # team code -> display names this market mentions
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -45,6 +67,16 @@ class Market:
             'last_price': self.last_price,
             'close_time': self.close_time,
             'volume': self.volume,
+            'best_bid': self.best_bid,
+            'best_ask': self.best_ask,
+            'league': self.league,
+            'game_id': self.game_id,
+            'event_date': self.event_date,
+            'market_type': self.market_type,
+            'outcome': self.outcome,
+            'line': self.line,
+            'negated': self.negated,
+            'teams': self.teams,
         }
 
 
@@ -99,7 +131,8 @@ class OrderBook:
 
 
 def markets_to_df(markets: list[Market]) -> pd.DataFrame:
-    cols = ['venue', 'market_id', 'title', 'is_open', 'is_resolved', 'last_price', 'close_time', 'volume']
+    cols = ['venue', 'market_id', 'title', 'is_open', 'is_resolved', 'last_price', 'close_time', 'volume',
+            'best_bid', 'best_ask', 'league', 'game_id', 'event_date', 'market_type', 'outcome', 'line', 'negated', 'teams']
     return pd.DataFrame([m.to_row() for m in markets], columns=cols)
 
 

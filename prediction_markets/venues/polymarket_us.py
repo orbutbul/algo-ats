@@ -17,13 +17,28 @@ not real trades).
 Notable quirks baked in: the "ask" side of the book is named `offers`, not
 `asks`; a resolved market can show `active:true` AND `closed:true`
 simultaneously (use `closed`, not `active`, for is_resolved/is_open);
-prices are `{value, currency}` objects, not bare numbers.
+prices are `{value, currency}` objects, not bare numbers; /v1/markets
+paginates by `offset` (no cursor/eof keys come back, confirmed live
+2026-09-24) and defaults to oldest-first, so `closed=false` is sent
+server-side or the first pages are all settled markets; `outcomes` order is
+shuffled per market and `outcomePrices` are per-side buy quotes (not
+always long-first), so the long side comes from `marketSides[long=true]`
+and prices from `bestBidQuote`/`bestAskQuote` (which are the long side's).
+
+Sports game markets (full-game winner/spread/total, identified by
+`sportsMarketType`) also get the normalized proposition fields on Market.
+Slugs are `<prefix>-<league>-<team a>-<team b>-<YYYY-MM-DD>[-...]`, shared by
+every market on the game. A spread's long side is always the named team: a
+negative `line` means "team wins by more than |line|" (same proposition as
+Kalshi's YES), a positive one means "team doesn't lose by more than line",
+i.e. the negation of "other team wins by more than line".
 """
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
+import re
+from collections.abc import Iterable
+from datetime import date, datetime, timezone
 
 import pandas as pd
 
@@ -48,19 +63,6 @@ PAGE_LIMIT = 100
 _RESOLUTION_PARAMS = {'1m': ('INTERVAL_6H', 1), '1h': ('INTERVAL_1D', 5), '1d': ('INTERVAL_ALL', 180)}
 
 
-def _coerce_list(value, default=None):
-    """.us fields like outcomes/outcomePrices may come back as a JSON-encoded
-    string (Gamma-style) or an already-parsed list -- handle either."""
-    if value is None:
-        return default if default is not None else []
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return default if default is not None else []
-    return value
-
-
 def _price_value(obj) -> float | None:
     """Unwraps a {'value': '0.69', 'currency': 'USD'} price object, or
     passes through a bare numeric/string price."""
@@ -69,6 +71,75 @@ def _price_value(obj) -> float | None:
     if isinstance(obj, dict):
         obj = obj.get('value')
     return float(obj) if obj not in (None, '') else None
+
+
+_SLUG_GAME_RE = re.compile(r'^[a-z]+-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-(\d{4}-\d{2}-\d{2})')
+
+# marketTypes values that hold full-game winner/spread/total markets -- pass
+# as list_markets(market_types=...) for cross-venue matching.
+SPORTS_MARKET_TYPES = ('moneyline', 'spreads', 'totals')
+
+
+def _sports_market_type(sports_market_type: str | None) -> str | None:
+    """'winner' / 'spread' / 'total' for full-game markets only -- not halves,
+    quarters, or single-team totals ('football_team_points_full_game_total')."""
+    smt = sports_market_type or ''
+    if smt.endswith('_team_full_game_winner') or smt == 'ufc_fight_winner':
+        return 'winner'
+    if smt.endswith('_team_full_game_spread'):
+        return 'spread'
+    if smt.endswith('_team_full_game_total'):
+        return 'total'
+    return None
+
+
+def _long_side(m: dict) -> dict | None:
+    return next((s for s in m.get('marketSides') or [] if s.get('long')), None)
+
+
+def _sports_fields(m: dict) -> dict:
+    """Normalized proposition fields (see models.Market) for a full-game
+    winner/spread/total market; {} for anything else."""
+    market_type = _sports_market_type(m.get('sportsMarketType'))
+    slug_match = _SLUG_GAME_RE.match(m.get('slug', ''))
+    long_side = _long_side(m)
+    if market_type is None or slug_match is None or long_side is None:
+        return {}
+    league, team_a, team_b, game_date = slug_match.groups()
+
+    teams: dict[str, tuple[str, ...]] = {team_a: (), team_b: ()}
+    for side in m.get('marketSides') or []:
+        team = side.get('team') or {}
+        if team.get('abbreviation') in teams:
+            names = (team.get('name'), team.get('alias'), team.get('safeName'))
+            teams[team['abbreviation']] = tuple(dict.fromkeys(n for n in names if n))
+
+    long_team = (long_side.get('team') or {}).get('abbreviation')
+    fields = {
+        'league': league,
+        'game_id': f'{league}-{team_a}-{team_b}-{game_date}',
+        'event_date': date.fromisoformat(game_date),
+        'market_type': market_type,
+        'teams': teams,
+    }
+    if market_type == 'winner':
+        if long_team not in teams:
+            return {}
+        fields['outcome'] = long_team
+    elif market_type == 'spread':
+        line = m.get('line')
+        if long_team not in teams or not line:   # line 0 (pick'em) has no Kalshi equivalent
+            return {}
+        if line < 0:
+            fields.update(outcome=long_team, line=-float(line))
+        else:
+            other_team = team_b if long_team == team_a else team_a
+            fields.update(outcome=other_team, line=float(line), negated=True)
+    else:  # total
+        if m.get('line') is None:
+            return {}
+        fields.update(line=float(m['line']), negated=long_side.get('description') == 'Under')
+    return fields
 
 
 class PolymarketUSClient(VenueClient):
@@ -81,8 +152,15 @@ class PolymarketUSClient(VenueClient):
         return get_json(f'{GATEWAY_BASE_URL}{path}', params=params, limiter=self._limiter)
 
     def _market_from_raw(self, m: dict) -> Market:
-        outcome_prices = _coerce_list(m.get('outcomePrices'))
-        last_price = _price_value(outcome_prices[0]) if outcome_prices else None
+        # The list payload has no last-trade price: outcomePrices/marketSides
+        # prices are per-side *buy* quotes (long = best ask, short = 1 - best
+        # bid), and with one side of the book empty outcomePrices[0] is the
+        # short side's. So last_price is the long side's bid/ask midpoint,
+        # falling back to whichever quote exists.
+        best_bid = _price_value(m.get('bestBidQuote'))
+        best_ask = _price_value(m.get('bestAskQuote'))
+        quotes = [q for q in (best_bid, best_ask) if q is not None]
+        last_price = round(sum(quotes) / len(quotes), 4) if quotes else None
         closed = bool(m.get('closed', False))
         return Market(
             venue=self.name,
@@ -94,24 +172,41 @@ class PolymarketUSClient(VenueClient):
             close_time=pd.to_datetime(m['endDate'], utc=True) if m.get('endDate') else None,
             volume=None,  # not exposed on .us market objects (confirmed absent in recon)
             raw=m,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            **_sports_fields(m),
         )
 
-    def list_markets(self, *, open_only: bool = True) -> pd.DataFrame:
+    def list_markets(
+        self,
+        *,
+        open_only: bool = True,
+        market_types: str | Iterable[str] | None = None,
+    ) -> pd.DataFrame:
+        """`market_types` filters server-side on the market's `marketType`
+        ('moneyline', 'spreads', 'totals', 'futures', 'props', ...), e.g.
+        SPORTS_MARKET_TYPES for cross-venue matching (~22k markets, vs
+        paging through every futures/props market too)."""
+        base_params: dict = {'limit': PAGE_LIMIT}
+        if open_only:
+            base_params['closed'] = 'false'
+        if isinstance(market_types, str):
+            base_params['marketTypes'] = market_types
+        elif market_types is not None:
+            base_params['marketTypes'] = list(market_types)
+
         markets: list[Market] = []
-        cursor = None
+        offset = 0
         while True:
-            params: dict = {'limit': PAGE_LIMIT}
-            if cursor:
-                params['cursor'] = cursor
-            data = self._get('/v1/markets', params)
+            data = self._get('/v1/markets', {**base_params, 'offset': offset})
             page = data.get('markets', [])
             for m in page:
                 mk = self._market_from_raw(m)
                 if not open_only or mk.is_open:
                     markets.append(mk)
-            if data.get('eof', True) or not data.get('nextCursor'):
+            if len(page) < PAGE_LIMIT:
                 break
-            cursor = data['nextCursor']
+            offset += PAGE_LIMIT
         return markets_to_df(markets)
 
     def get_market(self, market_id: str) -> pd.DataFrame:

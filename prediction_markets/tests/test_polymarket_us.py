@@ -8,6 +8,7 @@ import pytest
 
 from prediction_markets.venues.polymarket_us import (
     GATEWAY_BASE_URL,
+    PAGE_LIMIT,
     PolymarketUSClient,
 )
 
@@ -33,6 +34,21 @@ def test_list_markets_open_only_false_includes_it(requests_mock):
     df = PolymarketUSClient().list_markets(open_only=False)
     assert len(df) == 1
     assert bool(df.iloc[0]['is_resolved']) is True
+
+
+def test_list_markets_paginates_by_offset_with_server_filters(requests_mock):
+    # live /v1/markets returns neither cursor nor eof -- a short page ends it
+    open_market = {**MARKET, 'closed': False}
+    requests_mock.get(f'{GATEWAY_BASE_URL}/v1/markets', [
+        {'json': {'markets': [{**open_market, 'slug': f's{i}'} for i in range(PAGE_LIMIT)]}},
+        {'json': {'markets': [open_market]}},
+    ])
+    df = PolymarketUSClient().list_markets(market_types=['moneyline', 'spreads'])
+    assert len(df) == PAGE_LIMIT + 1
+    first, second = requests_mock.request_history
+    assert first.qs['offset'] == ['0'] and second.qs['offset'] == [str(PAGE_LIMIT)]
+    assert first.qs['closed'] == ['false']
+    assert first.qs['markettypes'] == ['moneyline', 'spreads']
 
 
 def test_get_market(requests_mock):

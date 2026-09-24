@@ -41,6 +41,19 @@ def test_list_markets_paginates(requests_mock):
     assert set(df['market_id']) == {'KXNFLGAME-26SEP20LVLAC-LAC', 'OTHER-TICKER'}
 
 
+def test_list_markets_series_ticker_walks_each_series(requests_mock):
+    requests_mock.get(f'{BASE_URL}/markets', json={'markets': [MARKET], 'cursor': ''})
+    df = KalshiClient().list_markets(series_ticker=['KXNFLGAME', 'KXNFLTOTAL'])
+    assert len(df) == 2
+    assert [r.qs['series_ticker'] for r in requests_mock.request_history] == [['kxnflgame'], ['kxnfltotal']]
+
+
+def test_sports_fields_on_winner_market():
+    row = KalshiClient()._market_from_raw({**MARKET, 'yes_sub_title': 'Los Angeles C'})
+    assert (row.league, row.game_id, row.market_type, row.outcome) == ('nfl', 'nfl:26SEP20LVLAC', 'winner', 'LAC')
+    assert str(row.event_date) == '2026-09-20'
+
+
 def test_get_market(requests_mock):
     requests_mock.get(f'{BASE_URL}/markets/KXNFLGAME-26SEP20LVLAC-LAC', json={'market': MARKET})
     df = KalshiClient().get_market('KXNFLGAME-26SEP20LVLAC-LAC')
