@@ -10,6 +10,7 @@ import pytest
 
 from prediction_markets.wallets import (
     DATA_BASE_URL,
+    GAMMA_BASE_URL,
     PolymarketWalletScanner,
     score_closed_positions,
     wilson_lower_bound,
@@ -50,6 +51,18 @@ def test_score_counts_both_sides_as_one_market():
 
 def test_score_empty():
     assert score_closed_positions(pd.DataFrame())['n_markets'] == 0
+
+
+def test_edge_z_ranks_price_beaters_above_favourite_buyers():
+    # 19/20 wins buying at 0.98 is exactly what the prices implied (19.6 expected)
+    fav = pd.DataFrame([_pos(f'0x{i}', 0, 0.98, 100, 2 if i < 19 else -98, i) for i in range(20)])
+    # 12/20 wins buying at 0.40 beats the 8 the prices implied
+    dog = pd.DataFrame([_pos(f'0x{i}', 0, 0.40, 100, 60 if i < 12 else -40, i) for i in range(20)])
+    fav_s, dog_s = score_closed_positions(fav), score_closed_positions(dog)
+    assert fav_s['win_rate_lb'] > dog_s['win_rate_lb']   # the old sort key got this backwards
+    assert fav_s['edge_z'] == pytest.approx((19 - 19.6) / math.sqrt(20 * 0.98 * 0.02))
+    assert dog_s['edge_z'] == pytest.approx((12 - 8) / math.sqrt(20 * 0.4 * 0.6))
+    assert dog_s['edge_z'] > 1.5 > 0 > fav_s['edge_z']
 
 
 def test_leaderboard_pages_at_50(requests_mock):
@@ -97,10 +110,50 @@ def test_settled_positions_includes_unredeemed_losers(requests_mock):
              'redeemable': True, 'endDate': '2033-05-18'}
     undated = {**loser, 'conditionId': '0xc', 'endDate': '1970-01-01'}
     requests_mock.get(f'{DATA_BASE_URL}/positions', json=[loser, undated])
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets', json=[])
     scanner = PolymarketWalletScanner(calls_per_second=1000)
-    pos = scanner.settled_positions(W1, since=pd.Timestamp('2033-01-01', tz='UTC').to_pydatetime())
+    pos = scanner.settled_positions(W1, since=pd.Timestamp('2020-01-01', tz='UTC').to_pydatetime())
     assert list(pos['source']) == ['closed', 'unredeemed']
     assert pos['realizedPnl'].iloc[1] == pytest.approx(-58232.16)
+    # no closedTime -> endDate fallback, clipped: a resolved market can't resolve in 2033
+    assert pos['timestamp'].iloc[1] <= pd.Timestamp.now(tz='UTC').timestamp()
     s = score_closed_positions(pos)
     assert s['n_markets'] == 2 and s['wins'] == 1
-    assert requests_mock.request_history[-1].qs['redeemable'] == ['true']
+    positions_call = next(r for r in requests_mock.request_history if r.path == '/positions')
+    assert positions_call.qs['redeemable'] == ['true']
+
+
+def _unredeemed(cond, end_date):
+    return {'proxyWallet': W1, 'conditionId': cond, 'outcomeIndex': 0, 'avgPrice': 0.3,
+            'totalBought': 100, 'cashPnl': -30, 'realizedPnl': 0, 'curPrice': 0,
+            'redeemable': True, 'endDate': end_date}
+
+
+def test_unredeemed_dated_by_gamma_closed_time(requests_mock):
+    # "by Dec 31 2027" market that actually resolved in Sept 2026
+    requests_mock.get(f'{DATA_BASE_URL}/positions',
+                      json=[_unredeemed('0xa', '2027-12-31'), _unredeemed('0xb', '2026-01-01')])
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets', json=[
+        {'conditionId': '0xa', 'closedTime': '2026-09-21 16:52:14+00'},
+        {'conditionId': '0xb', 'closedTime': '2026-01-01 04:00:00+00'},
+    ])
+    scanner = PolymarketWalletScanner(calls_per_second=1000)
+    df = scanner.unredeemed_positions(W1, since=pd.Timestamp('2026-09-01', tz='UTC').to_pydatetime())
+    assert list(df['conditionId']) == ['0xa']
+    assert df['timestamp'].iloc[0] == pd.Timestamp('2026-09-21 16:52:14', tz='UTC').timestamp()
+    gamma = requests_mock.request_history[-1]
+    assert gamma.qs['closed'] == ['true'] and gamma.qs['condition_ids'] == ['0xa', '0xb']
+
+
+def test_capped_wallet_cuts_unredeemed_to_closed_span(requests_mock):
+    # 2 closed rows = the cap; oldest at t=2_000_000_000. The unredeemed loser
+    # resolved before that, in the part of the window the closed rows never reached.
+    requests_mock.get(f'{DATA_BASE_URL}/closed-positions', json=[
+        _pos('0xa', 0, 0.5, 10, 5, 2_000_000_100), _pos('0xb', 0, 0.5, 10, 5, 2_000_000_000)])
+    requests_mock.get(f'{DATA_BASE_URL}/positions', json=[_unredeemed('0xc', '2030-01-01')])
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets', json=[
+        {'conditionId': '0xc', 'closedTime': str(pd.Timestamp(1_999_999_000, unit='s', tz='UTC'))}])
+    scanner = PolymarketWalletScanner(calls_per_second=1000)
+    since = pd.Timestamp(1_900_000_000, unit='s', tz='UTC').to_pydatetime()
+    pos = scanner.settled_positions(W1, since, max_positions=2)
+    assert list(pos['source']) == ['closed', 'closed']

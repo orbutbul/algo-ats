@@ -56,7 +56,7 @@ class VenueHTTPError(Exception):
 def get_json(
     url: str,
     *,
-    params: dict[str, Any] | None = None,
+    params: dict[str, Any] | list[tuple[str, Any]] | None = None,  # list for repeated keys
     headers: dict[str, str] | None = None,
     limiter: RateLimiter | None = None,
     retries: int = DEFAULT_RETRIES,
