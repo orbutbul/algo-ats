@@ -11,7 +11,7 @@ plain visible text, and parse it by section header.
 Usage:
     from extraction.wsb import fetch_wsb_post, get_latest_wsb_data
     data = get_latest_wsb_data()
-    df   = get_latest_wsb_data(as_df=True)  # DataFrame of biggest_movers
+    df   = get_latest_wsb_data(as_df=True)  # DataFrame of mentions_v2
 
 Debug (inspect raw widget text when the app changes):
     from extraction.wsb import dump_widget_text
@@ -175,8 +175,9 @@ def _wait_for_rows_or_empty(
     header: str,
     cols: int,
     empty_markers: list[str],
-    timeout_ms: int = 8_000,
+    timeout_ms: int = 12_000,
     poll_ms: int = 400,
+    stable_polls: int = 2,
 ) -> str:
     """
     Like `_wait_for_body_markers`, but for panels backed by a header + row
@@ -185,18 +186,35 @@ def _wait_for_rows_or_empty(
     panel in the DOM, so `header` (e.g. "Score") can appear in the body text
     before the real panel's rows have actually rendered, causing the caller
     to capture the header with zero data rows after it (a spurious 0-row
-    snapshot). Instead, poll until `header` is followed by at least `cols`
-    values (one full row), or one of `empty_markers` (the widget's own
-    "no data" message) appears, or `timeout_ms` elapses.
+    snapshot).
+
+    Returning as soon as *any* full row is present isn't enough either: the
+    Portfolio panel can render its rows incrementally (a handful appear,
+    then more trickle in), and a single early poll would lock in a
+    truncated snapshot (e.g. 2-4 rows instead of the usual ~19) even though
+    the page was still loading. So we require the parsed row list to come
+    back identical across `stable_polls` consecutive polls -- i.e. it has
+    stopped growing/changing -- before treating it as complete. If it never
+    stabilizes before `timeout_ms`, we fall back to whatever's there (same
+    as before: a late/partial snapshot beats no snapshot at all).
     """
     elapsed = 0
     text = frame.inner_text("body")
+    prev_rows: list[list[str]] | None = None
+    stable_count = 0
     while elapsed < timeout_ms:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if any(m in text for m in empty_markers):
             return text
-        if _rows_after_marker(lines, header, cols):
-            return text
+        rows = _rows_after_marker(lines, header, cols)
+        if rows:
+            if rows == prev_rows:
+                stable_count += 1
+                if stable_count >= stable_polls:
+                    return text
+            else:
+                stable_count = 0
+            prev_rows = rows
         frame.page.wait_for_timeout(poll_ms)
         elapsed += poll_ms
         text = frame.inner_text("body")
@@ -297,8 +315,6 @@ _SECTION_HEADERS = ["MENTIONS 24H", "SENTIMENT", "LEADERBOARD", "TOP HOLDINGS", 
 _SECTION_END = "CONNECT & VERIFY"
 _JUNK_LINES = {"TABLE", "CHART", "COMMENTS", "STREAKS", "·"}
 
-_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
-
 
 def _num(s: str) -> float | None:
     """Parse '$1,365.50', '-7.95%', '+$44.4k', '×250' etc. into a float."""
@@ -319,9 +335,9 @@ def _num(s: str) -> float | None:
 
 def _split_sections(text: str) -> dict[str, list[str]]:
     """
-    Split raw widget text into named line-blocks: ticker_strip (everything
-    before the first known header) plus one block per known section header,
-    each cut off at the next known header (or CONNECT & VERIFY at the end).
+    Split raw widget text into named line-blocks: one block per known
+    section header, each cut off at the next known header (or
+    CONNECT & VERIFY at the end).
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
@@ -336,16 +352,6 @@ def _split_sections(text: str) -> dict[str, list[str]]:
             header_positions.append((ln, i))
 
     sections: dict[str, list[str]] = {}
-    first_header_idx = header_positions[0][1] if header_positions else len(lines)
-
-    # Ticker strip: everything before the first header, starting from the
-    # first line that actually looks like a ticker symbol (skips nav chrome
-    # like "Closed" / "Opens 9h 54m" / "Daily Thread" / "Me" / "Data" / "Casino").
-    strip_start = next(
-        (i for i in range(first_header_idx) if _TICKER_RE.match(lines[i])),
-        first_header_idx,
-    )
-    sections["ticker_strip"] = lines[strip_start:first_header_idx]
 
     for idx, (name, pos) in enumerate(header_positions):
         stop = header_positions[idx + 1][1] if idx + 1 < len(header_positions) else end_idx
@@ -369,18 +375,6 @@ def _parse_ticker_groups(lines: list[str], cols: int) -> list[dict]:
             row["count"] = _num(group[3])
         out.append(row)
     return out
-
-
-def _parse_biggest_movers(lines: list[str]) -> list[dict]:
-    rows = _parse_ticker_groups(lines, cols=3)
-    seen = set()
-    deduped = []
-    for r in rows:
-        if r["ticker"] in seen:
-            continue
-        seen.add(r["ticker"])
-        deduped.append(r)
-    return deduped
 
 
 def _parse_sentiment_state(lines: list[str]) -> dict:
@@ -557,7 +551,6 @@ def _extract_wsb_data(views: dict[str, str]) -> dict:
     mentions_v2_lines = [ln.strip() for ln in views.get("mentions_v2", "").splitlines() if ln.strip()]
 
     return {
-        "biggest_movers": _parse_biggest_movers(sections.get("ticker_strip", [])),
         "mentions":       _parse_ticker_groups(sections.get("MENTIONS 24H", []), cols=4),
         "sentiment":      _combine_sentiment(
                               sections.get("SENTIMENT", []),
@@ -671,7 +664,8 @@ def _parse_listing_json(data: dict) -> list[dict]:
 def fetch_wsb_post(post_url: str) -> dict:
     """
     Render a verified-trader post URL and return a dict with all extracted data.
-    Keys: biggest_movers, mentions, sentiment, leaderboard, top_holdings, top_trades
+    Keys: mentions, sentiment, leaderboard, top_holdings, top_trades, positions_v2,
+    mentions_v2, portfolio_summary
     """
     views = _capture_widget_views(post_url)
     return _extract_wsb_data(views)
@@ -691,7 +685,9 @@ def get_latest_wsb_data(
         'weekend'  → title contains 'Weekend Discussion'
         any string → used as a raw substring filter on the title
 
-    If as_df=True, returns a DataFrame of biggest_movers.
+    If as_df=True, returns a DataFrame of mentions_v2 (the live Data > Sentiment
+    ticker list -- biggest_movers/ticker_strip parsing was removed, see
+    module docstring history in git log).
     """
     keywords = {
         "moves":   "What Are Your Moves",
@@ -730,7 +726,7 @@ def get_latest_wsb_data(
     data["post_date"]  = target["created_utc"]
 
     if as_df:
-        return pd.DataFrame(data["biggest_movers"])
+        return pd.DataFrame(data["mentions_v2"])
 
     return data
 
@@ -809,10 +805,6 @@ _TABLES = {
     },
     "top_trades": {
         "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, contract VARCHAR, qty DOUBLE, pnl DOUBLE",
-        "dedup_cols": ["date", "hour", "rank"],
-    },
-    "biggest_movers": {
-        "schema": "date DATE, hour INTEGER, rank INTEGER, ticker VARCHAR, price DOUBLE, change_pct DOUBLE",
         "dedup_cols": ["date", "hour", "rank"],
     },
     "mentions": {
@@ -915,15 +907,6 @@ def save_wsb_data(data: dict) -> None:
                 for i, r in enumerate(data.get("top_trades", []))]
         _upsert(con, "top_trades", pd.DataFrame(rows))
 
-        # --- biggest_movers ---
-        # The ticker-strip this parses no longer reliably exists post-redesign;
-        # only keep rows that actually resolved a price, to avoid writing
-        # tickers with all-null price/change_pct.
-        rows = [{"date": date, "hour": hour, "rank": i + 1, **r}
-                for i, r in enumerate(data.get("biggest_movers", []))
-                if r.get("price") is not None]
-        _upsert(con, "biggest_movers", pd.DataFrame(rows))
-
         # --- mentions ---
         rows = []
         for i, m in enumerate(data.get("mentions", [])):
@@ -962,8 +945,8 @@ def load_wsb_data(table: str, date_from: str | None = None) -> pd.DataFrame:
     Read a stored WSB table from data/wsb.duckdb.
 
     table: 'sentiment' | 'sentiment_most_bearish' | 'sentiment_most_bullish'
-         | 'top_holdings' | 'top_trades' | 'biggest_movers' | 'mentions'
-         | 'leaderboard' | 'leaderboard_streaks'
+         | 'top_holdings' | 'top_trades' | 'mentions'
+         | 'leaderboard' | 'leaderboard_streaks' | 'mentions_v2' | 'positions_v2'
     date_from: optional ISO date string, e.g. '2026-05-01'
     """
     if table not in _TABLES:
