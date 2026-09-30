@@ -14,6 +14,7 @@ from prediction_markets.copy_backtest import (
     WalletCopyBacktest,
     asof_price,
     backtest,
+    daily_marks,
     wallet_events,
 )
 
@@ -122,13 +123,30 @@ def test_activity_pages_past_offset_cap(requests_mock, monkeypatch):
     assert qs[0]['sortdirection'] == ['asc'] and qs[0]['type'] == ['trade']
 
 
+def test_activity_windows_fetch_in_parallel_and_dedupe_boundaries(requests_mock, monkeypatch):
+    monkeypatch.setattr('prediction_markets.copy_backtest.ACTIVITY_WINDOW_SECONDS', 50)
+    rows = [_trade(T0 + ts, 'yes', '0xc', 'BUY', ts, 0.5) for ts in (0, 20, 50, 70, 100)]
+
+    def server(request, context):   # honours start/end like the real endpoint
+        lo, hi = int(request.qs['start'][0]), int(request.qs['end'][0])
+        return [r for r in rows if lo <= r['timestamp'] <= hi]
+
+    requests_mock.get(f'{DATA_BASE_URL}/activity', json=server)
+    df = WalletCopyBacktest(calls_per_second=1000).activity(W, 'TRADE', T0, T0 + 100)
+    assert list(df['size']) == [0, 20, 50, 70, 100]   # T0+50 is in both windows, kept once
+    assert len(requests_mock.request_history) == 2
+    assert list(df.columns) == ['type', 'transactionHash', 'asset', 'conditionId', 'side', 'size',
+                                'price', 'timestamp', 'usdcSize']
+
+
 def test_market_tokens_parses_gamma(requests_mock):
     closed = {'conditionId': '0xc', 'question': 'Q?', 'closed': True, 'outcomes': '["Yes", "No"]',
               'outcomePrices': '["0", "1"]', 'clobTokenIds': '["111", "222"]',
               'closedTime': '2026-09-21 16:52:14+00', 'endDate': '2026-12-31T00:00:00Z'}
     open_ = {'conditionId': '0xd', 'question': 'R?', 'closed': False, 'outcomes': '["Yes", "No"]',
              'outcomePrices': '["0.3", "0.7"]', 'clobTokenIds': '["333", "444"]', 'endDate': '2026-12-31'}
-    requests_mock.get(f'{GAMMA_BASE_URL}/markets', [{'json': [closed]}, {'json': [open_]}])
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets',
+                      json=lambda req, ctx: [closed] if req.qs['closed'] == ['true'] else [open_])
     df = WalletCopyBacktest(calls_per_second=1000).market_tokens(['0xc', '0xd']).set_index('token')
     assert list(df.index) == ['111', '222', '333', '444']
     assert df.at['222', 'payout'] == 1.0 and df.at['111', 'outcome'] == 'Yes'
@@ -154,3 +172,35 @@ def test_split_then_sell_is_copied_at_par():
     # the sale was right (No went to 0): drift in the wallet's favour is positive
     d = res.drift.set_index('side').loc['SELL']
     assert d['drift_1m'] == pytest.approx(0.62 - 0.63) and d['drift_final'] == pytest.approx(0.62)
+
+
+def test_batches_match_one_pass(monkeypatch):
+    # the two tokens overlap in time; one batch each must give the same totals
+    act = pd.DataFrame([_trade(T0, 'yes', '0xc', 'BUY', 100, 0.4),
+                        _trade(T0 + 60, 'no', '0xc', 'BUY', 50, 0.5),
+                        _trade(T0 + 3600, 'yes', '0xc', 'SELL', 50, 0.6)])
+    prices = pd.concat([_prices('yes', [(0, 0.40), (60, 0.50), (3600, 0.60), (3660, 0.70)]),
+                        _prices('no', [(0, 0.60), (60, 0.50), (120, 0.45), (86400, 0.2)])])
+    ev = wallet_events(act, TOKENS)
+    end_ts = T0 + 3 * 86400
+    one = backtest(W, ev, TOKENS, prices, [60], 0.01, None, end_ts)
+
+    bt = WalletCopyBacktest()
+    monkeypatch.setattr('prediction_markets.copy_backtest.TOKENS_PER_BATCH', 1)
+    monkeypatch.setattr(bt, 'token_prices',
+                        lambda e, *a: (prices[prices['token'].isin(e['token'])], {}))
+    two = bt.backtest_events(W, ev, TOKENS, [60], 0.01, None, end_ts)
+    pd.testing.assert_frame_equal(one.summary, two.summary)
+    pd.testing.assert_frame_equal(one.equity, two.equity)
+    assert one.summary.set_index('scenario').at['wallet fill', 'capital_needed'] == pytest.approx(65)
+
+
+def test_daily_marks_only_inside_each_tokens_life():
+    orders = pd.DataFrame({'token': ['yes', 'no'], 't': [T0, T0 + 86400]})
+    tokens = TOKENS.set_index('token').assign(resolved_ts=[T0 + 2 * 86400, np.nan])
+    prices = pd.concat([_prices('yes', [(0, 0.4)]), _prices('no', [(0, 0.6)])])
+    m = daily_marks(orders, tokens, prices, end_ts=T0 + 3 * 86400 + 60)
+    midnight = T0 - 3600
+    assert sorted(zip(m['token'], m['t_ns'] // 10**9)) == [
+        ('no', midnight + 2 * 86400), ('no', midnight + 3 * 86400),
+        ('yes', midnight + 86400), ('yes', midnight + 2 * 86400)]

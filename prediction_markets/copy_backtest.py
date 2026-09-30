@@ -76,18 +76,22 @@ from prediction_markets.http import RateLimiter, get_json, log
 from prediction_markets.venues.polymarket_com import CLOB_BASE_URL, _parse_json_field
 from prediction_markets.wallets import DATA_BASE_URL, GAMMA_BASE_URL, GAMMA_IDS_PER_CALL
 
-CALLS_PER_SECOND = 15              # /activity allows 200/10s, CLOB /prices-history 1000/10s
+CALLS_PER_SECOND = 15              # Data API /activity allows 200/10s
+CLOB_CALLS_PER_SECOND = 50         # CLOB /prices-history allows 1000/10s
 ACTIVITY_PAGE_LIMIT = 500          # server cap
 ACTIVITY_MAX_OFFSET = 5000         # server rejects deeper offsets
 PRICE_CHUNK_SECONDS = 7 * 86400
 FALLBACK_FIDELITIES = (60, 720)    # minutes; old resolved tokens lose 1-minute history
 DEFAULT_LAGS = (0, 60, 300, 3600)
-FETCH_THREADS = 8                  # prices-history is latency-bound; the limiter still paces
+FETCH_THREADS = 16                 # fetches are latency-bound; the limiters still pace
+ACTIVITY_WINDOW_SECONDS = 7 * 86400
 DRIFT_HORIZONS = (60, 300, 3600, 86400)
 MAX_PRICE = 0.999
-COLUMNS_PER_SIM = 200
+COLUMNS_PER_SIM = 500
+TOKENS_PER_BATCH = 20_000
 OUT_DIR = Path(__file__).parent.parent / 'data' / 'prediction_markets' / 'copy_backtest'
 _ACTIVITY_KEY = ['type', 'transactionHash', 'asset', 'conditionId', 'side', 'size', 'price', 'timestamp']
+_ACTIVITY_COLUMNS = _ACTIVITY_KEY + ['usdcSize']
 _VALUE = vbt.pf_enums.SizeType.Value
 _PERCENT = vbt.pf_enums.SizeType.Percent
 
@@ -179,22 +183,34 @@ def daily_marks(orders: pd.DataFrame, tokens: pd.DataFrame, prices: pd.DataFrame
     (or `end_ts`), so the equity curve moves between the wallet's own trades."""
     if orders.empty:
         return pd.DataFrame(columns=['t_ns', 'token', 'mark'])
-    span = orders.groupby('token')['t'].min().to_frame('first')
-    span['last'] = tokens['resolved_ts'].reindex(span.index).fillna(end_ts).clip(upper=end_ts)
-    days = np.arange((span['first'].min() // 86400 + 1) * 86400, end_ts + 1, 86400)
-    grid = span.reset_index().merge(pd.DataFrame({'t': days}), how='cross')
-    grid = grid[(grid['t'] > grid['first']) & (grid['t'] < grid['last'])]
+    first = orders.groupby('token')['t'].min()
+    last = tokens['resolved_ts'].reindex(first.index).fillna(end_ts).clip(upper=end_ts)
+    # midnights strictly inside (first, last), generated per token: a year of
+    # short-lived sports markets would make a tokens x days grid enormous
+    day0 = first // 86400 + 1
+    n = (np.ceil(last / 86400) - day0).clip(lower=0).astype(int)
+    tok = np.repeat(first.index.to_numpy(), n.to_numpy())
+    t = (np.repeat(day0.to_numpy(), n.to_numpy()) + np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) * 86400
+    grid = pd.DataFrame({'token': tok, 't': t.astype('int64')})
     grid = grid.assign(mark=asof_price(prices, grid['token'], grid['t']), t_ns=grid['t'] * 10**9)
     return grid.dropna(subset=['mark'])[['t_ns', 'token', 'mark']]
 
 
+def _sum_by_time(parts: list[pd.Series]) -> pd.Series:
+    """Add up per-time increments from many chunks. Summing a wide
+    (timestamps x chunks) frame instead blows up for a market maker's year."""
+    parts = [p for p in parts if len(p)]
+    return pd.concat(parts).groupby(level=0).sum().sort_index() if parts else pd.Series(dtype=float)
+
+
 def simulate(orders: pd.DataFrame, marks: pd.DataFrame) -> dict:
     """Run the orders through vbt, one column per token, in column chunks.
-    Returns per-token invested/pnl, the summed pnl curve and cash flow."""
+    Returns per-token invested/pnl, and the change in total pnl (mark to
+    market) and the total cash flow at each timestamp."""
     if orders.empty:
         return {'per_token': pd.DataFrame(columns=['invested', 'pnl']),
-                'pnl_curve': pd.Series(dtype=float), 'cash_flow': pd.Series(dtype=float)}
-    per_token, curves, flows = [], [], []
+                'pnl_steps': pd.Series(dtype=float), 'cash_flow': pd.Series(dtype=float)}
+    per_token, steps, flows = [], [], []
     tokens = orders.groupby('token')['t_ns'].min().sort_values().index  # neighbours share rows
     for i in range(0, len(tokens), COLUMNS_PER_SIM):
         cols = tokens[i:i + COLUMNS_PER_SIM]
@@ -211,23 +227,21 @@ def simulate(orders: pd.DataFrame, marks: pd.DataFrame) -> dict:
         cash_flow = pf.cash_flow
         per_token.append(pd.DataFrame({'invested': -cash_flow.clip(upper=0).sum(),
                                        'pnl': pf.total_profit}))
-        curves.append((pf.value - pf.init_cash).ffill().fillna(0).sum(axis=1))
+        curve = (pf.value - pf.init_cash).ffill().fillna(0).sum(axis=1)
+        steps.append(curve.diff().fillna(curve.iloc[0]))
         flows.append(cash_flow.sum(axis=1))
-    join = lambda parts: pd.concat(parts, axis=1).sort_index()  # noqa: E731
-    return {'per_token': pd.concat(per_token),
-            'pnl_curve': join(curves).ffill().fillna(0).sum(axis=1),
-            'cash_flow': join(flows).fillna(0).sum(axis=1)}
+    return {'per_token': pd.concat(per_token), 'pnl_steps': _sum_by_time(steps),
+            'cash_flow': _sum_by_time(flows)}
 
 
-def summarize(name: str, orders: pd.DataFrame, sim: dict, tokens: pd.DataFrame,
+def summarize(name: str, n_buys: int, sim: dict, tokens: pd.DataFrame,
               n_wallet_buys: int, end_ts: int) -> dict:
     per = sim['per_token'].join(tokens[['condition_id', 'resolved_ts']])
     markets = per.groupby('condition_id')[['pnl', 'invested']].sum()
     markets = markets[markets['invested'] > 0]
     pnl, invested = per['pnl'].sum(), per['invested'].sum()
-    curve = sim['pnl_curve']
+    curve = sim['pnl_steps'].cumsum()
     capital = (-sim['cash_flow'].cumsum()).max()
-    n_buys = int((orders['side'] == 'BUY').sum())
     sd = markets['pnl'].std()
     return {
         'scenario': name,
@@ -288,7 +302,7 @@ class CopyBacktestResult:
     wallet: str
     summary: pd.DataFrame     # one row per scenario
     drift: pd.DataFrame       # one row per wallet TRADE fill
-    equity: pd.DataFrame      # follower pnl curve, one column per scenario
+    equity: pd.DataFrame      # follower pnl curve (hourly), one column per scenario
     per_token: pd.DataFrame   # invested/pnl per scenario x token
     events: pd.DataFrame
     tokens: pd.DataFrame
@@ -298,82 +312,129 @@ class CopyBacktestResult:
         return drift_summary(self.drift)
 
 
-def backtest(wallet: str, events: pd.DataFrame, tokens: pd.DataFrame, prices: pd.DataFrame,
-             lags: Iterable[int], slippage: float, stake: float | None, end_ts: int) -> CopyBacktestResult:
-    """Offline core of run(): every scenario over already-fetched data.
-    `tokens` = market_tokens() output, one row per token id."""
-    meta = tokens.set_index('token')
+def scenarios(lags: Iterable[int]) -> dict[str, int | None]:
+    return {'wallet fill': None} | {f'lag {fmt_seconds(lag)}': lag for lag in lags}
+
+
+def simulate_batch(events: pd.DataFrame, tokens: pd.DataFrame, prices: pd.DataFrame, lags: Iterable[int],
+                   slippage: float, stake: float | None, end_ts: int) -> dict:
+    """Every scenario, plus drift, for one set of tokens. Tokens never
+    interact, so a big wallet can be run batch by batch and assemble()d.
+    `tokens` is indexed by token id."""
     lags = list(lags)
+    sims = {}
+    for name, lag in scenarios(lags).items():
+        orders = copy_orders(events, tokens, prices, lag, slippage, stake, end_ts)
+        sims[name] = (int((orders['side'] == 'BUY').sum()),
+                      simulate(orders, daily_marks(orders, tokens, prices, end_ts)))
+    horizons = sorted(set(lags) | set(DRIFT_HORIZONS))
+    return {'sims': sims, 'drift': post_entry_drift(events, tokens, prices, horizons, end_ts)}
+
+
+def assemble(wallet: str, batches: list[dict], events: pd.DataFrame, tokens: pd.DataFrame,
+             end_ts: int) -> CopyBacktestResult:
+    """Combine simulate_batch() outputs into one result. `tokens` =
+    market_tokens() output (optionally with a `fidelity` column)."""
+    meta = tokens.set_index('token')
     n_wallet_buys = int((events['side'] == 'BUY').sum())   # split legs count as buys
-    scenarios = {'wallet fill': None} | {f'lag {fmt_seconds(lag)}': lag for lag in lags}
-    rows, curves, per_token = [], {}, []
-    for name, lag in scenarios.items():
-        orders = copy_orders(events, meta, prices, lag, slippage, stake, end_ts)
-        sim = simulate(orders, daily_marks(orders, meta, prices, end_ts))
-        rows.append(summarize(name, orders, sim, meta, n_wallet_buys, end_ts))
-        curves[name] = sim['pnl_curve']
+    rows, equity, per_token = [], {}, []
+    for name in batches[0]['sims']:
+        parts = [b['sims'][name] for b in batches]
+        sim = {'per_token': pd.concat([sim['per_token'] for _, sim in parts]),
+               'pnl_steps': _sum_by_time([sim['pnl_steps'] for _, sim in parts]),
+               'cash_flow': _sum_by_time([sim['cash_flow'] for _, sim in parts])}
+        rows.append(summarize(name, sum(n for n, _ in parts), sim, meta, n_wallet_buys, end_ts))
+        if len(sim['pnl_steps']):
+            equity[name] = sim['pnl_steps'].cumsum().resample('1h').last()
         per_token.append(sim['per_token'].assign(scenario=name))
     summary = pd.DataFrame(rows)
     base = summary['pnl'].iloc[0]
     summary['pnl_vs_fill'] = summary['pnl'] / base if base > 0 else np.nan
-    per_token = pd.concat(per_token).join(meta[['question', 'outcome', 'fidelity']]
-                                          if 'fidelity' in meta else meta[['question', 'outcome']])
-    horizons = sorted(set(lags) | set(DRIFT_HORIZONS))
+    info = meta[[c for c in ('question', 'outcome', 'fidelity') if c in meta]]
     return CopyBacktestResult(
         wallet=wallet, summary=summary,
-        drift=post_entry_drift(events, meta, prices, horizons, end_ts),
-        equity=pd.DataFrame(curves).sort_index().ffill().fillna(0),
-        per_token=per_token.rename_axis('token').reset_index(), events=events, tokens=tokens)
+        drift=pd.concat([b['drift'] for b in batches], ignore_index=True),
+        equity=pd.DataFrame(equity).ffill().fillna(0),
+        per_token=pd.concat(per_token).join(info).rename_axis('token').reset_index(),
+        events=events, tokens=tokens)
+
+
+def backtest(wallet: str, events: pd.DataFrame, tokens: pd.DataFrame, prices: pd.DataFrame,
+             lags: Iterable[int], slippage: float, stake: float | None, end_ts: int) -> CopyBacktestResult:
+    """Offline core of run() for data already in memory: one batch."""
+    batch = simulate_batch(events, tokens.set_index('token'), prices, lags, slippage, stake, end_ts)
+    return assemble(wallet, [batch], events, tokens, end_ts)
 
 
 class WalletCopyBacktest:
-    def __init__(self, calls_per_second: float = CALLS_PER_SECOND):
+    def __init__(self, calls_per_second: float = CALLS_PER_SECOND,
+                 clob_calls_per_second: float = CLOB_CALLS_PER_SECOND):
         self._limiter = RateLimiter(calls_per_second)
+        self._clob_limiter = RateLimiter(clob_calls_per_second)
 
     def activity(self, wallet: str, kind: str, start: int, end: int) -> pd.DataFrame:
         """All /activity rows of one `kind` (TRADE, SPLIT, MERGE, ...) with
-        start <= timestamp <= end, oldest first."""
-        rows: list[dict] = []
+        start <= timestamp <= end, oldest first, trimmed to the columns used
+        here (full rows carry titles/icons: ~2 KB each, 6 GB for a busy year).
+        Long spans are split into weekly windows fetched in parallel, since
+        paging is latency-bound; rows on a shared boundary second are deduped."""
+        windows = [(s, min(s + ACTIVITY_WINDOW_SECONDS, end))
+                   for s in range(start, end, ACTIVITY_WINDOW_SECONDS)] or [(start, end)]
+        with ThreadPoolExecutor(FETCH_THREADS) as pool:
+            frames = list(pool.map(lambda w: self._activity_window(wallet, kind, *w), windows))
+        df = pd.concat(frames, ignore_index=True)
+        return (df.drop_duplicates(subset=_ACTIVITY_KEY).sort_values('timestamp', kind='stable')
+                .reset_index(drop=True))
+
+    def _activity_window(self, wallet: str, kind: str, start: int, end: int) -> pd.DataFrame:
+        pages: list[pd.DataFrame] = []
         cursor, offset = start, 0
         while True:
             page = get_json(f'{DATA_BASE_URL}/activity', params={
                 'user': wallet, 'type': kind, 'start': cursor, 'end': end,
                 'sortBy': 'TIMESTAMP', 'sortDirection': 'ASC',
                 'limit': ACTIVITY_PAGE_LIMIT, 'offset': offset}, limiter=self._limiter)
-            rows.extend(page)
+            pages.append(pd.DataFrame(page).reindex(columns=_ACTIVITY_COLUMNS))
             if len(page) < ACTIVITY_PAGE_LIMIT:
                 break
             offset += len(page)
             if offset >= ACTIVITY_MAX_OFFSET:
-                # restart from the last second seen; its rows repeat and are deduped below
+                # restart from the last second seen; its rows repeat and are deduped
                 cursor, offset = page[-1]['timestamp'], 0
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        return df.drop_duplicates(subset=[c for c in _ACTIVITY_KEY if c in df]).reset_index(drop=True)
+        n = sum(map(len, pages))
+        if n >= 10_000:
+            print(f'  {kind} {datetime.fromtimestamp(start, timezone.utc):%Y-%m-%d}: {n:,} rows', flush=True)
+        return pd.concat(pages, ignore_index=True)
 
     def market_tokens(self, condition_ids: Iterable[str]) -> pd.DataFrame:
         """One row per outcome token of the given markets: resolution time
         (unix s, NaN if open) and payout (NaN if open)."""
         ids = list(dict.fromkeys(condition_ids))
+
+        def fetch(call):
+            chunk, closed = call
+            params = [('condition_ids', c) for c in chunk] + [('closed', closed), ('limit', len(chunk))]
+            return get_json(f'{GAMMA_BASE_URL}/markets', params=params, limiter=self._limiter)
+
+        calls = [(ids[i:i + GAMMA_IDS_PER_CALL], closed)
+                 for i in range(0, len(ids), GAMMA_IDS_PER_CALL) for closed in ('true', 'false')]
+        with ThreadPoolExecutor(FETCH_THREADS) as pool:
+            pages = list(pool.map(fetch, calls))
         rows: list[dict] = []
-        for i in range(0, len(ids), GAMMA_IDS_PER_CALL):
-            chunk = ids[i:i + GAMMA_IDS_PER_CALL]
-            for closed in ('true', 'false'):
-                params = [('condition_ids', c) for c in chunk] + [('closed', closed), ('limit', len(chunk))]
-                for m in get_json(f'{GAMMA_BASE_URL}/markets', params=params, limiter=self._limiter):
-                    token_ids = _parse_json_field(m.get('clobTokenIds'), [])
-                    outcomes = _parse_json_field(m.get('outcomes'), [])
-                    payouts = _parse_json_field(m.get('outcomePrices'), [])
-                    is_closed = bool(m.get('closed'))
-                    for j, tok in enumerate(token_ids):
-                        rows.append({
-                            'token': tok, 'condition_id': m['conditionId'], 'outcome_index': j,
-                            'outcome': outcomes[j] if j < len(outcomes) else None,
-                            'question': m.get('question', ''),
-                            'payout': float(payouts[j]) if is_closed and j < len(payouts) else np.nan,
-                            'resolved_at': (m.get('closedTime') or m.get('endDate')) if is_closed else None,
-                        })
+        for page in pages:
+            for m in page:
+                token_ids = _parse_json_field(m.get('clobTokenIds'), [])
+                outcomes = _parse_json_field(m.get('outcomes'), [])
+                payouts = _parse_json_field(m.get('outcomePrices'), [])
+                is_closed = bool(m.get('closed'))
+                for j, tok in enumerate(token_ids):
+                    rows.append({
+                        'token': tok, 'condition_id': m['conditionId'], 'outcome_index': j,
+                        'outcome': outcomes[j] if j < len(outcomes) else None,
+                        'question': m.get('question', ''),
+                        'payout': float(payouts[j]) if is_closed and j < len(payouts) else np.nan,
+                        'resolved_at': (m.get('closedTime') or m.get('endDate')) if is_closed else None,
+                    })
         df = pd.DataFrame(rows, columns=['token', 'condition_id', 'outcome_index', 'outcome',
                                          'question', 'payout', 'resolved_at'])
         when = pd.to_datetime(df['resolved_at'], utc=True, errors='coerce')
@@ -384,7 +445,7 @@ class WalletCopyBacktest:
         """(ts, price) points for one token up to `end`, and the fidelity (minutes) used."""
         def fetch(params):
             data = get_json(f'{CLOB_BASE_URL}/prices-history', params={'market': token, **params},
-                            limiter=self._limiter)
+                            limiter=self._clob_limiter)
             return data.get('history', [])
 
         fidelity = 1
@@ -406,9 +467,18 @@ class WalletCopyBacktest:
         span = events.groupby('token')['ts'].agg(['min', 'max'])
         res = tokens.set_index('token')['resolved_ts'].reindex(span.index).fillna(np.inf)
         stop = np.minimum(np.minimum(span['max'] + horizon, res + 60), end_ts).astype('int64')
+        def fetch(item):
+            i, tok = item
+            if i % 1000 == 0:
+                print(f'  price history {i}/{len(span)} tokens', flush=True)
+            try:
+                return self.price_history(tok, int(span.at[tok, 'min']) - 3600, int(stop[tok]))
+            except Exception as e:  # one bad token shouldn't sink an hour-long fetch
+                log.warning('price history failed for %s: %s', tok, e)
+                return pd.DataFrame(columns=['ts', 'price', 'token']), np.nan
+
         with ThreadPoolExecutor(FETCH_THREADS) as pool:
-            got = list(pool.map(lambda tok: self.price_history(tok, int(span.at[tok, 'min']) - 3600,
-                                                               int(stop[tok])), span.index))
+            got = list(pool.map(fetch, enumerate(span.index)))
         fidelity = {tok: fid for tok, (_, fid) in zip(span.index, got)}
         prices = (pd.concat([df for df, _ in got], ignore_index=True) if got
                   else pd.DataFrame(columns=['ts', 'price', 'token']))
@@ -428,10 +498,25 @@ class WalletCopyBacktest:
         tokens = self.market_tokens(activity['conditionId'])
         events = wallet_events(activity, tokens)
         log.info('copy backtest %s: %d events on %d tokens', wallet, len(events), events['token'].nunique())
-        print(f'{len(events)} wallet events on {events["token"].nunique()} tokens; fetching price history')
-        prices, fidelity = self.token_prices(events, tokens, end_ts, max(lags, default=0))
+        print(f'{len(events):,} wallet events on {events["token"].nunique():,} tokens')
+        return self.backtest_events(wallet, events, tokens, lags, slippage, stake, end_ts)
+
+    def backtest_events(self, wallet: str, events: pd.DataFrame, tokens: pd.DataFrame, lags: Iterable[int],
+                        slippage: float, stake: float | None, end_ts: int) -> CopyBacktestResult:
+        """Fetch prices and simulate TOKENS_PER_BATCH tokens at a time: a market
+        maker's year (~250k tokens, ~75M price points) never fits in memory at once."""
+        lags = list(lags)
+        meta = tokens.set_index('token')
+        first = events.groupby('token')['ts'].min().sort_values()
+        batch_of = pd.Series(np.arange(len(first)) // TOKENS_PER_BATCH, index=first.index)
+        batches, fidelity = [], {}
+        for b, ev in events.groupby(events['token'].map(batch_of)):
+            print(f'batch {b + 1}/{batch_of.max() + 1}: {ev["token"].nunique():,} tokens', flush=True)
+            prices, fid = self.token_prices(ev, tokens, end_ts, max(lags, default=0))
+            fidelity.update(fid)
+            batches.append(simulate_batch(ev, meta, prices, lags, slippage, stake, end_ts))
         tokens = tokens.assign(fidelity=tokens['token'].map(fidelity))
-        return backtest(wallet, events, tokens, prices, lags, slippage, stake, end_ts)
+        return assemble(wallet, batches, events, tokens, end_ts)
 
 
 def main(argv: list[str] | None = None) -> None:
