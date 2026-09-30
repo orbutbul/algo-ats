@@ -9,6 +9,7 @@ policy instead of four slightly different ones.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -36,17 +37,20 @@ class RateLimiter:
     """Steady-interval throttle: keeps spacing between calls at
     >= 1/calls_per_second seconds. Mirrors ohlcv_massive._RateLimiter,
     parameterized by calls/sec instead of calls/min since every prediction-
-    market venue documents its limit that way."""
+    market venue documents its limit that way. Thread-safe: callers fetching
+    in parallel share one limiter, so the venue sees the same pacing."""
 
     def __init__(self, calls_per_second: float):
         self.interval = 1.0 / calls_per_second
         self._last_call = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        elapsed = time.monotonic() - self._last_call
-        if elapsed < self.interval:
-            time.sleep(self.interval - elapsed)
-        self._last_call = time.monotonic()
+        with self._lock:
+            elapsed = time.monotonic() - self._last_call
+            if elapsed < self.interval:
+                time.sleep(self.interval - elapsed)
+            self._last_call = time.monotonic()
 
 
 class VenueHTTPError(Exception):
