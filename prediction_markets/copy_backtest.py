@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -72,7 +73,7 @@ import numpy as np
 import pandas as pd
 import vectorbtpro as vbt
 
-from prediction_markets.http import RateLimiter, get_json, log
+from prediction_markets.http import RateLimiter, VenueHTTPError, get_json, log
 from prediction_markets.venues.polymarket_com import CLOB_BASE_URL, _parse_json_field
 from prediction_markets.wallets import DATA_BASE_URL, GAMMA_BASE_URL, GAMMA_IDS_PER_CALL
 
@@ -85,6 +86,9 @@ FALLBACK_FIDELITIES = (60, 720)    # minutes; old resolved tokens lose 1-minute 
 DEFAULT_LAGS = (0, 60, 300, 3600)
 FETCH_THREADS = 16                 # fetches are latency-bound; the limiters still pace
 ACTIVITY_WINDOW_SECONDS = 7 * 86400
+GAMMA_THREADS = 4                  # 16 parallel Gamma lookups drew a Cloudflare 403
+CHALLENGE_RETRIES = 3
+CHALLENGE_BACKOFF = 3              # seconds, doubled per retry
 DRIFT_HORIZONS = (60, 300, 3600, 86400)
 MAX_PRICE = 0.999
 COLUMNS_PER_SIM = 500
@@ -94,6 +98,18 @@ _ACTIVITY_KEY = ['type', 'transactionHash', 'asset', 'conditionId', 'side', 'siz
 _ACTIVITY_COLUMNS = _ACTIVITY_KEY + ['usdcSize']
 _VALUE = vbt.pf_enums.SizeType.Value
 _PERCENT = vbt.pf_enums.SizeType.Percent
+
+
+def _get_json_through_challenges(url: str, params, limiter: RateLimiter):
+    """get_json, retrying Cloudflare's 403 challenge page, which Polymarket's
+    APIs serve transiently to bursts of parallel requests."""
+    for attempt in range(CHALLENGE_RETRIES):
+        try:
+            return get_json(url, params=params, limiter=limiter)
+        except VenueHTTPError as e:
+            if not str(e).startswith('403') or attempt == CHALLENGE_RETRIES - 1:
+                raise
+            time.sleep(CHALLENGE_BACKOFF * 2 ** attempt)
 
 
 def fmt_seconds(s: int) -> str:
@@ -414,11 +430,21 @@ class WalletCopyBacktest:
         def fetch(call):
             chunk, closed = call
             params = [('condition_ids', c) for c in chunk] + [('closed', closed), ('limit', len(chunk))]
-            return get_json(f'{GAMMA_BASE_URL}/markets', params=params, limiter=self._limiter)
+            try:
+                return _get_json_through_challenges(f'{GAMMA_BASE_URL}/markets', params, self._limiter)
+            except VenueHTTPError as e:
+                # some requests are blocked every time (a WAF rule, not load): halve
+                # the chunk until the offending market is alone, and drop only it
+                if len(chunk) > 1:
+                    half = len(chunk) // 2
+                    return fetch((chunk[:half], closed)) + fetch((chunk[half:], closed))
+                log.warning('gamma lookup failed for %s (closed=%s): %s', chunk[0], closed, str(e)[:100])
+                print(f'  gamma lookup failed for market {chunk[0]} (closed={closed}); skipped', flush=True)
+                return []
 
         calls = [(ids[i:i + GAMMA_IDS_PER_CALL], closed)
                  for i in range(0, len(ids), GAMMA_IDS_PER_CALL) for closed in ('true', 'false')]
-        with ThreadPoolExecutor(FETCH_THREADS) as pool:
+        with ThreadPoolExecutor(GAMMA_THREADS) as pool:
             pages = list(pool.map(fetch, calls))
         rows: list[dict] = []
         for page in pages:
@@ -444,8 +470,8 @@ class WalletCopyBacktest:
     def price_history(self, token: str, start: int, end: int) -> tuple[pd.DataFrame, int]:
         """(ts, price) points for one token up to `end`, and the fidelity (minutes) used."""
         def fetch(params):
-            data = get_json(f'{CLOB_BASE_URL}/prices-history', params={'market': token, **params},
-                            limiter=self._clob_limiter)
+            data = _get_json_through_challenges(f'{CLOB_BASE_URL}/prices-history',
+                                                {'market': token, **params}, self._clob_limiter)
             return data.get('history', [])
 
         fidelity = 1

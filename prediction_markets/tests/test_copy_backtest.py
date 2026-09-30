@@ -4,6 +4,8 @@ the simulation, and /activity + Gamma payload shapes captured live 2026-09-30
 for the fetchers -- no network calls.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -137,6 +139,38 @@ def test_activity_windows_fetch_in_parallel_and_dedupe_boundaries(requests_mock,
     assert len(requests_mock.request_history) == 2
     assert list(df.columns) == ['type', 'transactionHash', 'asset', 'conditionId', 'side', 'size',
                                 'price', 'timestamp', 'usdcSize']
+
+
+def test_cloudflare_403_is_retried(requests_mock, monkeypatch):
+    monkeypatch.setattr('prediction_markets.copy_backtest.CHALLENGE_BACKOFF', 0)
+    market = {'conditionId': '0xc', 'question': 'Q?', 'closed': False, 'outcomes': '["Yes", "No"]',
+              'outcomePrices': '["0.3", "0.7"]', 'clobTokenIds': '["333", "444"]'}
+    challenge = {'status_code': 403, 'text': '<title>Attention Required! | Cloudflare</title>'}
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets', [challenge, challenge, {'json': [market]}])
+    bt = WalletCopyBacktest(calls_per_second=1000)
+    monkeypatch.setattr('prediction_markets.copy_backtest.GAMMA_THREADS', 1)
+    df = bt.market_tokens(['0xc'])
+    assert list(df['token']) == ['333', '444']      # 2 challenges, then both closed= calls succeed
+    assert len(requests_mock.request_history) == 4
+
+
+def test_blocked_market_is_isolated_by_halving(requests_mock, monkeypatch):
+    monkeypatch.setattr('prediction_markets.copy_backtest.CHALLENGE_BACKOFF', 0)
+    monkeypatch.setattr('prediction_markets.copy_backtest.CHALLENGE_RETRIES', 1)
+
+    def server(request, context):   # any request naming 0xbad is always blocked
+        ids = request.qs['condition_ids']
+        if '0xbad' in ids:
+            context.status_code = 403
+            return '<title>Attention Required! | Cloudflare</title>'
+        closed = request.qs['closed'] == ['true']
+        return json.dumps([{'conditionId': c, 'question': c, 'closed': closed, 'outcomes': '["Yes", "No"]',
+                            'outcomePrices': '["1", "0"]', 'clobTokenIds': f'["{c}y", "{c}n"]'}
+                           for c in ids if (c == '0xc') == closed])
+
+    requests_mock.get(f'{GAMMA_BASE_URL}/markets', text=server)
+    df = WalletCopyBacktest(calls_per_second=1000).market_tokens(['0xa', '0xb', '0xbad', '0xc'])
+    assert sorted(df['token']) == ['0xan', '0xay', '0xbn', '0xby', '0xcn', '0xcy']   # only 0xbad lost
 
 
 def test_market_tokens_parses_gamma(requests_mock):
