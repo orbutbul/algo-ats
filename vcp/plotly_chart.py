@@ -35,8 +35,9 @@ def build_vcp_figure(
         rows=2,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.72, 0.28],
+        # Keep volume flush under price (TradingView-style), not a separate island.
+        vertical_spacing=0.0,
+        row_heights=[0.78, 0.22],
     )
 
     fig.add_trace(
@@ -140,22 +141,39 @@ def build_vcp_figure(
         col=1,
     )
 
-    fig.update_yaxes(type='log', title_text='Price (log)', row=1, col=1)
-    fig.update_yaxes(title_text='Volume', row=2, col=1)
-    fig.update_xaxes(title_text=None, row=1, col=1)
-    fig.update_xaxes(title_text=None, row=2, col=1)
+    fig.update_yaxes(
+        type='log',
+        title_text='Price (log)',
+        row=1,
+        col=1,
+        showgrid=True,
+        zeroline=False,
+        # No gap strip between price and volume panes.
+        domain=None,
+    )
+    fig.update_yaxes(
+        title_text='Vol',
+        row=2,
+        col=1,
+        showgrid=False,
+        zeroline=False,
+        nticks=3,
+    )
+    fig.update_xaxes(title_text=None, showticklabels=False, row=1, col=1)
+    fig.update_xaxes(title_text=None, showticklabels=True, row=2, col=1)
     fig.update_layout(
         title=dict(
             text=title or f'{result.ticker} · {len(result.breakouts)} VCP breakout(s)',
             font=dict(size=20, family='Fraunces, Georgia, serif', color='#1b2a4a'),
         ),
         template='plotly_white',
-        height=720,
-        margin=dict(l=56, r=24, t=64, b=40),
+        height=760,
+        margin=dict(l=56, r=24, t=64, b=36),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
         paper_bgcolor='#f3efe6',
         plot_bgcolor='#f8f5ee',
         font=dict(family='IBM Plex Sans, Helvetica, sans-serif', color='#243044'),
         hovermode='x unified',
+        bargap=0.05,
     )
     return fig
