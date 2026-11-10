@@ -44,4 +44,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["regime/tests", "prediction_markets/tests"]
+testpaths = ["regime/tests", "prediction_markets/tests", "live_signals/tests"]
