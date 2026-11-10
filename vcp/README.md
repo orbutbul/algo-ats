@@ -14,6 +14,10 @@ python -m vcp chart NVDA --out artifacts/nvda_vcp.png --json-out artifacts/nvda_
 
 # Recent window
 python -m vcp chart NVDA --start 2020-01-01 --out artifacts/nvda_vcp_recent.png
+
+# Interactive web viewer (type a ticker, see history + VCP marks)
+python -m vcp view --port 8765
+# → http://127.0.0.1:8765
 ```
 
 Uses `vectorbtpro` when installed; otherwise open-source `vectorbt` for MAs
@@ -25,5 +29,7 @@ Uses `vectorbtpro` when installed; otherwise open-source `vectorbt` for MAs
 - `pivots.py` — swing highs/lows
 - `detector.py` — contraction sequence + breakout scan
 - `io.py` — read/seed DuckDB
-- `plot.py` — log price + volume chart
-- `cli.py` — `seed` / `chart` / `scan`
+- `plot.py` — static matplotlib log chart
+- `plotly_chart.py` — interactive Plotly chart
+- `viewer.py` — local Flask web UI
+- `cli.py` — `seed` / `chart` / `scan` / `view`

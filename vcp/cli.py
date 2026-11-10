@@ -11,6 +11,7 @@ from vcp.io import OHLCV_DUCKDB_PATH, list_tickers, load_daily_ohlcv, seed_daily
 from vcp.params import VCPParams
 from vcp.plot import plot_vcp_history
 from vcp.vbt_compat import VBT_FLAVOR
+from vcp.viewer import run_viewer
 
 
 def _parse_params(ns: argparse.Namespace) -> VCPParams:
@@ -57,6 +58,11 @@ def cmd_chart(args: argparse.Namespace) -> int:
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.write_text(json.dumps(summary, indent=2, default=str))
         print(f'Wrote {json_path}')
+    return 0
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    run_viewer(host=args.host, port=args.port, duckdb_path=Path(args.duckdb))
     return 0
 
 
@@ -112,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument('--min-contractions', type=int, default=None)
     scan.add_argument('--no-trend-template', action='store_true')
     scan.set_defaults(func=cmd_scan)
+
+    view = sub.add_parser('view', help='Open a local web viewer for ticker VCP history')
+    view.add_argument('--host', default='127.0.0.1')
+    view.add_argument('--port', type=int, default=8765)
+    view.set_defaults(func=cmd_view)
     return p
 
 
