@@ -9,8 +9,6 @@ dependencies = [
     "datetime>=6.0",
     "duckdb>=1.5.2",
     "ipykernel>=7.2.0",
-    "joblib>=1.5.2",
-    "lightgbm>=4.6.0",
     "matplotlib>=3.10.9",
     "moomoo-api>=10.9.6908",
     "nbclient>=0.11.0",
@@ -24,7 +22,6 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pytrends>=4.9.2",
     "requests>=2.34.0",
-    "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
     "tradingview-screener>=3.2.0",
@@ -44,4 +41,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["regime/tests", "prediction_markets/tests"]
+testpaths = ["prediction_markets/tests"]
