@@ -46,4 +46,7 @@ airflow/
 
 # Claude Code local agent state (settings.local.json, scheduled_tasks.lock,
 # plans, old worktree copies) -- never part of the repo
-.claude/artifacts/
+.claude/
+
+# Local VCP chart outputs
+artifacts/
