@@ -75,6 +75,76 @@ def list_tickers(path: Path | None = None) -> list[str]:
     return [r[0] for r in rows]
 
 
+def _ohlcv_fields_from_frame(part: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a single-ticker OHLCV frame to lower-case open/high/low/close/volume."""
+    out = part.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        fields = {'open', 'high', 'low', 'close', 'adj close', 'volume'}
+        chosen = None
+        for level, name in enumerate(out.columns.names or []):
+            if name is not None and str(name).lower() == 'price':
+                chosen = level
+                break
+        if chosen is None:
+            for level in range(out.columns.nlevels):
+                vals = {str(v).lower() for v in out.columns.get_level_values(level)}
+                if vals & fields:
+                    chosen = level
+                    break
+        if chosen is None:
+            chosen = out.columns.nlevels - 1
+        out.columns = out.columns.get_level_values(chosen)
+    out.columns = [str(c).strip().lower().replace('adj close', 'close') for c in out.columns]
+    return out
+
+
+def _frames_from_yfinance(raw: pd.DataFrame, tickers: list[str]) -> list[pd.DataFrame]:
+    """Split a yfinance download into per-ticker flat OHLCV frames."""
+    frames: list[pd.DataFrame] = []
+    if raw.empty:
+        return frames
+
+    if not isinstance(raw.columns, pd.MultiIndex):
+        if len(tickers) != 1:
+            raise RuntimeError(f'Expected MultiIndex columns for tickers {tickers}, got {list(raw.columns)}')
+        part = _ohlcv_fields_from_frame(raw)
+        part['ticker'] = tickers[0]
+        frames.append(part.rename_axis('datetime').reset_index())
+        return frames
+
+    level0 = {str(v).upper() for v in raw.columns.get_level_values(0)}
+    # (Ticker, Price) when group_by='ticker'
+    if any(t in level0 for t in tickers):
+        for t in tickers:
+            if t not in raw.columns.get_level_values(0):
+                # yfinance sometimes lowercases unexpectedly; try casefold match.
+                matches = [v for v in raw.columns.get_level_values(0) if str(v).upper() == t]
+                if not matches:
+                    continue
+                key = matches[0]
+            else:
+                key = t
+            part = _ohlcv_fields_from_frame(raw.xs(key, axis=1, level=0))
+            part['ticker'] = t
+            frames.append(part.rename_axis('datetime').reset_index())
+        return frames
+
+    # (Price, Ticker)
+    for t in tickers:
+        keys = list(raw.columns.get_level_values(-1))
+        if t in keys:
+            key = t
+        else:
+            matches = [v for v in keys if str(v).upper() == t]
+            if not matches:
+                continue
+            key = matches[0]
+        part = _ohlcv_fields_from_frame(raw.xs(key, axis=1, level=-1))
+        part['ticker'] = t
+        frames.append(part.rename_axis('datetime').reset_index())
+    return frames
+
+
 def seed_daily_ohlcv(
     tickers: list[str],
     path: Path | None = None,
@@ -106,42 +176,17 @@ def seed_daily_ohlcv(
     if raw.empty:
         raise RuntimeError(f'yfinance returned no data for {tickers}')
 
-    frames: list[pd.DataFrame] = []
-    if len(tickers) == 1:
-        t = tickers[0]
-        part = raw.copy()
-        part.columns = [str(c).lower() for c in part.columns]
-        part['ticker'] = t
-        part = part.rename_axis('datetime').reset_index()
-        frames.append(part)
-    else:
-        # yfinance multi-ticker: columns MultiIndex (ticker, field) or (field, ticker)
-        if isinstance(raw.columns, pd.MultiIndex):
-            level0 = list(raw.columns.get_level_values(0).unique())
-            if set(x.lower() for x in level0) >= {'open', 'high', 'low', 'close', 'volume'}:
-                # (field, ticker)
-                for t in tickers:
-                    try:
-                        part = raw.xs(t, axis=1, level=1).copy()
-                    except KeyError:
-                        continue
-                    part.columns = [str(c).lower() for c in part.columns]
-                    part['ticker'] = t
-                    frames.append(part.rename_axis('datetime').reset_index())
-            else:
-                for t in tickers:
-                    try:
-                        part = raw.xs(t, axis=1, level=0).copy()
-                    except KeyError:
-                        continue
-                    part.columns = [str(c).lower() for c in part.columns]
-                    part['ticker'] = t
-                    frames.append(part.rename_axis('datetime').reset_index())
-
+    frames = _frames_from_yfinance(raw, tickers)
     if not frames:
         raise RuntimeError(f'Could not parse yfinance payload for {tickers}')
 
     new_data = pd.concat(frames, ignore_index=True)
+    # yfinance may name the index column Date instead of datetime after reset_index.
+    if 'datetime' not in new_data.columns:
+        for cand in ('date', 'Date', 'index'):
+            if cand in new_data.columns:
+                new_data = new_data.rename(columns={cand: 'datetime'})
+                break
     keep = ['datetime', 'ticker', 'open', 'high', 'low', 'close', 'volume']
     for col in keep:
         if col not in new_data.columns:
