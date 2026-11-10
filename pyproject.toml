@@ -8,6 +8,7 @@ dependencies = [
     "alpaca-py>=0.43.5",
     "datetime>=6.0",
     "duckdb>=1.5.2",
+    "flask>=3.0.0",
     "ipykernel>=7.2.0",
     "matplotlib>=3.10.9",
     "moomoo-api>=10.9.6908",
@@ -41,4 +42,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["prediction_markets/tests", "relative_strength/tests", "live_signals/tests"]
+testpaths = ["prediction_markets/tests", "relative_strength/tests", "live_signals/tests", "vcp/tests"]
