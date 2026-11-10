@@ -170,6 +170,11 @@ def validate_fundamentals(screen: dict, specs: dict = FUNDAMENTALS_SPECS) -> lis
 
 
 def validate_wsb(run_date: date | None = None, run_hour: int | None = None) -> list[str]:
+    """Return soft data-quality issues for this UTC hour (empty list = pass).
+
+    Callers decide whether to ntfy — use extraction.wsb.classify_wsb_alerts()
+    so quiet widget hours and one-off races do not page every hour.
+    """
     now = datetime.now(timezone.utc)
     run_date = run_date or now.date()
     run_hour = run_hour if run_hour is not None else now.hour
@@ -180,7 +185,11 @@ def validate_wsb(run_date: date | None = None, run_hour: int | None = None) -> l
     issues = []
     con = duckdb.connect(str(WSB_DB_PATH), read_only=True)
     try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
         for table in ('mentions_v2', 'positions_v2'):
+            if table not in tables:
+                issues.append(f'{table}: table missing')
+                continue
             n = con.execute(
                 f'SELECT count(*) FROM {table} WHERE date = ? AND hour = ?',
                 [run_date, run_hour],
@@ -188,14 +197,19 @@ def validate_wsb(run_date: date | None = None, run_hour: int | None = None) -> l
             if n == 0:
                 issues.append(f'{table}: 0 rows for {run_date} hour={run_hour}')
 
-        row = con.execute(
-            'SELECT bullish_pct, bearish_pct FROM sentiment WHERE date = ? AND hour = ?',
-            [run_date, run_hour],
-        ).fetchone()
-        if row is None:
-            issues.append(f'sentiment: no row for {run_date} hour={run_hour}')
-        elif row[0] is None and row[1] is None:
-            issues.append(f'sentiment: bullish_pct and bearish_pct both null for {run_date} hour={run_hour}')
+        if 'sentiment' not in tables:
+            issues.append('sentiment: table missing')
+        else:
+            row = con.execute(
+                'SELECT bullish_pct, bearish_pct FROM sentiment WHERE date = ? AND hour = ?',
+                [run_date, run_hour],
+            ).fetchone()
+            if row is None:
+                issues.append(f'sentiment: no row for {run_date} hour={run_hour}')
+            elif row[0] is None and row[1] is None:
+                issues.append(
+                    f'sentiment: bullish_pct and bearish_pct both null for {run_date} hour={run_hour}'
+                )
     finally:
         con.close()
     return issues
