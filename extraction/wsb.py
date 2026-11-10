@@ -283,13 +283,30 @@ def _capture_widget_views(post_url: str) -> dict[str, str]:
 
             views["portfolio"] = ""
             views["mentions_v2"] = ""
+            # Capture diagnostics for wsb_run alert hygiene: distinguish a
+            # real tab-click / scrape bug from the widget legitimately having
+            # nothing to show this hour (which must not ntfy).
+            capture = {
+                "data_tab_ok": False,
+                "sentiment_tab_ok": False,
+                "portfolio_empty_widget": False,
+                "mentions_empty_widget": False,
+            }
             if _click_visible_text_retry(frame, "Data"):
+                capture["data_tab_ok"] = True
                 views["portfolio"] = _wait_for_rows_or_empty(
                     frame, "Δ", cols=10, empty_markers=["No positions data available"],
                 )
+                capture["portfolio_empty_widget"] = (
+                    "No positions data available" in (views["portfolio"] or "")
+                )
                 if _click_visible_text_retry(frame, "Sentiment"):
+                    capture["sentiment_tab_ok"] = True
                     views["mentions_v2"] = _wait_for_rows_or_empty(
                         frame, "Score", cols=6, empty_markers=["No sentiment data available"],
+                    )
+                    capture["mentions_empty_widget"] = (
+                        "No sentiment data available" in (views["mentions_v2"] or "")
                     )
                 else:
                     print(
@@ -302,6 +319,7 @@ def _capture_widget_views(post_url: str) -> dict[str, str]:
                     "positions_v2/mentions_v2 will be empty for this run"
                 )
 
+            views["_capture"] = capture
             return views
         finally:
             browser.close()
@@ -565,6 +583,9 @@ def _extract_wsb_data(views: dict[str, str]) -> dict:
         "positions_v2":   _parse_positions(portfolio_lines),
         "mentions_v2":    _parse_mentions_v2(mentions_v2_lines),
         "portfolio_summary": _parse_portfolio_summary(portfolio_lines),
+        # Not persisted — wsb_run uses this to decide whether empty tables are
+        # a real scrape bug (alert) or a quiet/empty widget hour (log only).
+        "_capture":       dict(views.get("_capture") or {}),
     }
 
 
@@ -786,6 +807,11 @@ def dump_widget_text(post_url: str | None = None, out_path: str = "widget_text_d
 
 WSB_DB_PATH = Path("data/wsb.duckdb")
 
+# Soft empty hours (widget quiet / one-off race) only escalate to ntfy after
+# this many consecutive UTC hours with 0 mentions_v2 rows. Hard scrape
+# failures and tab-click failures still alert immediately (see wsb_run.py).
+WSB_EMPTY_STREAK_ALERT_AFTER = 3
+
 _TABLES = {
     "sentiment": {
         "schema": "date DATE, hour INTEGER, bearish_pct DOUBLE, bullish_pct DOUBLE",
@@ -964,3 +990,96 @@ def load_wsb_data(table: str, date_from: str | None = None) -> pd.DataFrame:
         return con.execute(query, params).df()
     finally:
         con.close()
+
+
+def wsb_mentions_empty_streak(
+    run_date=None,
+    run_hour: int | None = None,
+    lookback: int = WSB_EMPTY_STREAK_ALERT_AFTER,
+) -> int:
+    """How many consecutive UTC hours ending at (run_date, run_hour) have
+    zero mentions_v2 rows (including hours with no rows at all). 0 if the
+    current hour has data."""
+    now = datetime.now(timezone.utc)
+    run_date = run_date or now.date()
+    run_hour = run_hour if run_hour is not None else now.hour
+
+    if not WSB_DB_PATH.exists():
+        return lookback
+
+    end = datetime(run_date.year, run_date.month, run_date.day, run_hour, tzinfo=timezone.utc)
+    hours = [end - pd.Timedelta(hours=i) for i in range(lookback)]
+
+    con = _connect_wsb_db(read_only=True)
+    try:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        if "mentions_v2" not in tables:
+            return lookback
+        streak = 0
+        for ts in hours:
+            n = con.execute(
+                "SELECT count(*) FROM mentions_v2 WHERE date = ? AND hour = ?",
+                [ts.date(), ts.hour],
+            ).fetchone()[0]
+            if n > 0:
+                break
+            streak += 1
+        return streak
+    finally:
+        con.close()
+
+
+def classify_wsb_alerts(
+    soft_issues: list[str],
+    capture: dict | None = None,
+    empty_streak: int = 0,
+    streak_alert_after: int = WSB_EMPTY_STREAK_ALERT_AFTER,
+) -> tuple[list[str], list[str]]:
+    """Split validate_wsb issues into (alert_now, log_only).
+
+    - Tab-click failures → alert immediately (scraper is broken).
+    - Widget's own "no data" markers covering the empty tables → log only.
+    - Ambiguous empty (likely race / quiet hour) → log only unless
+      empty_streak reaches streak_alert_after consecutive hours.
+    """
+    if not soft_issues:
+        return [], []
+
+    capture = capture or {}
+    data_tab_ok = bool(capture.get("data_tab_ok"))
+    sentiment_tab_ok = bool(capture.get("sentiment_tab_ok"))
+    portfolio_empty = bool(capture.get("portfolio_empty_widget"))
+    mentions_empty = bool(capture.get("mentions_empty_widget"))
+
+    if any("does not exist" in i or "table missing" in i for i in soft_issues):
+        return list(soft_issues), []
+
+    if not data_tab_ok or not sentiment_tab_ok:
+        reason = []
+        if not data_tab_ok:
+            reason.append("could not click Data tab")
+        if data_tab_ok and not sentiment_tab_ok:
+            reason.append("could not click Sentiment sub-tab")
+        return list(soft_issues) + reason, []
+
+    covered_by_empty_marker = True
+    for issue in soft_issues:
+        if issue.startswith("mentions_v2:") and not mentions_empty:
+            covered_by_empty_marker = False
+        elif issue.startswith("positions_v2:") and not portfolio_empty:
+            covered_by_empty_marker = False
+        elif issue.startswith("sentiment:") and not portfolio_empty:
+            # sentiment falls back to Portfolio "NN% BULLISH"; empty portfolio
+            # panel explains a missing sentiment row.
+            covered_by_empty_marker = False
+    if covered_by_empty_marker:
+        return [], list(soft_issues)
+
+    if empty_streak >= streak_alert_after:
+        return (
+            list(soft_issues)
+            + [f"{empty_streak} consecutive UTC hours with empty mentions_v2"],
+            [],
+        )
+
+    return [], list(soft_issues)
