@@ -52,8 +52,11 @@ def plot_vcp_history(
         xs: list[pd.Timestamp] = []
         ys: list[float] = []
         for c in bo.contractions:
-            xs.extend([_naive(c.peak.index), _naive(c.valley.index)])
-            ys.extend([c.peak.price, c.valley.price])
+            xs.extend([_naive(c.peak.index), _naive(c.trough.index)])
+            ys.extend([c.peak.price, c.trough.price])
+            if c.recovery_peak is not None:
+                xs.append(_naive(c.recovery_peak.index))
+                ys.append(c.recovery_peak.price)
         ax_px.plot(xs, ys, color=color, lw=1.6, alpha=0.85)
         bdate = _naive(bo.breakout_date)
         ax_px.axhline(bo.pivot_price, color=color, lw=0.7, ls='--', alpha=0.45)

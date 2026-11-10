@@ -32,12 +32,12 @@ def build_vcp_figure(
     df.index = _naive_index(pd.to_datetime(df.index))
 
     fig = make_subplots(
-        rows=2,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        # Keep volume flush under price (TradingView-style), not a separate island.
+        # Price + volume flush; ATR as a thin visual volatility strip under them.
         vertical_spacing=0.0,
-        row_heights=[0.78, 0.22],
+        row_heights=[0.68, 0.18, 0.14],
     )
 
     fig.add_trace(
@@ -69,8 +69,11 @@ def build_vcp_figure(
         xs: list[pd.Timestamp] = []
         ys: list[float] = []
         for c in bo.contractions:
-            xs.extend([_naive_ts(c.peak.index), _naive_ts(c.valley.index)])
-            ys.extend([c.peak.price, c.valley.price])
+            xs.extend([_naive_ts(c.peak.index), _naive_ts(c.trough.index)])
+            ys.extend([c.peak.price, c.trough.price])
+            if c.recovery_peak is not None:
+                xs.append(_naive_ts(c.recovery_peak.index))
+                ys.append(c.recovery_peak.price)
         fig.add_trace(
             go.Scatter(
                 x=xs,
@@ -79,7 +82,10 @@ def build_vcp_figure(
                 name=bo.footprint,
                 line=dict(color=color, width=2),
                 marker=dict(size=6, color=color),
-                hovertemplate=f'{bo.footprint}<br>%{{x|%Y-%m-%d}} %{{y:.2f}}<extra></extra>',
+                hovertemplate=(
+                    f'{bo.footprint}<br>%{{x|%Y-%m-%d}} %{{y:.2f}}'
+                    f'<extra></extra>'
+                ),
                 legendgroup=f'bo{i}',
             ),
             row=1,
@@ -87,6 +93,7 @@ def build_vcp_figure(
         )
         bdate = _naive_ts(bo.breakout_date)
         depths_pct = [round((math.exp(d) - 1) * 100, 1) for d in bo.depths]
+        atrs = [round(a, 2) for a in bo.depth_atrs]
         fig.add_trace(
             go.Scatter(
                 x=[bdate],
@@ -107,6 +114,7 @@ def build_vcp_figure(
                     f'pivot=%{{y:.2f}}<br>'
                     f'stop={bo.stop_price:.2f}<br>'
                     f'depths%={depths_pct}<br>'
+                    f'depth ATR={atrs}<br>'
                     f'rel vol={bo.breakout_rel_vol:.2f}'
                     f'<extra></extra>'
                 ),
@@ -141,33 +149,34 @@ def build_vcp_figure(
         col=1,
     )
 
-    fig.update_yaxes(
-        type='log',
-        title_text='Price (log)',
-        row=1,
-        col=1,
-        showgrid=True,
-        zeroline=False,
-        # No gap strip between price and volume panes.
-        domain=None,
-    )
-    fig.update_yaxes(
-        title_text='Vol',
-        row=2,
-        col=1,
-        showgrid=False,
-        zeroline=False,
-        nticks=3,
-    )
+    if result.atr is not None and len(result.atr):
+        atr = result.atr.reindex(df.index)
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=atr,
+                mode='lines',
+                name='ATR',
+                line=dict(color='#0f6a4f', width=1.2),
+                hovertemplate='%{x|%Y-%m-%d}<br>ATR=%{y:.2f}<extra></extra>',
+            ),
+            row=3,
+            col=1,
+        )
+
+    fig.update_yaxes(type='log', title_text='Price (log)', row=1, col=1, showgrid=True, zeroline=False)
+    fig.update_yaxes(title_text='Vol', row=2, col=1, showgrid=False, zeroline=False, nticks=3)
+    fig.update_yaxes(title_text='ATR', row=3, col=1, showgrid=False, zeroline=False, nticks=3)
     fig.update_xaxes(title_text=None, showticklabels=False, row=1, col=1)
-    fig.update_xaxes(title_text=None, showticklabels=True, row=2, col=1)
+    fig.update_xaxes(title_text=None, showticklabels=False, row=2, col=1)
+    fig.update_xaxes(title_text=None, showticklabels=True, row=3, col=1)
     fig.update_layout(
         title=dict(
             text=title or f'{result.ticker} · {len(result.breakouts)} VCP breakout(s)',
             font=dict(size=20, family='Fraunces, Georgia, serif', color='#1b2a4a'),
         ),
         template='plotly_white',
-        height=760,
+        height=820,
         margin=dict(l=56, r=24, t=64, b=36),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
         paper_bgcolor='#f3efe6',
