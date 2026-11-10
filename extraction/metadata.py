@@ -4,7 +4,7 @@ all asset classes (equities, ETFs, crypto), saved to
 data/metadata_consolidated.parquet.
 
 Additive: does not replace data/metadata.json (raw yfinance blobs,
-equities/ETFs) or data/fundamentals/{asset_class}_{freq}.parquet (curated,
+equities/ETFs) or database/fundamentals.duckdb::{asset}_{freq} (curated,
 staleness-tiered numeric fields) — this file sits on top of both, giving one
 directly queryable row per tracked ticker regardless of asset class.
 """

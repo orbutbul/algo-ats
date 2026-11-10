@@ -11,6 +11,7 @@ wheels/
 
 # actual data
 data/
+database/
 .env
 
 # RS proxy artifacts (generated). Source databases are not written here.

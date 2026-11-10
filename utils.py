@@ -20,7 +20,12 @@ from concurrent.futures import ThreadPoolExecutor
 # directory rather than the project root, still resolve correctly.
 OHLCV_PATH = Path(__file__).parent / 'data' / 'ohlcv_1min.parquet'   # legacy snapshot, frozen — see OHLCV_DUCKDB_PATH
 OHLCV_DUCKDB_PATH = Path(__file__).parent / 'data' / 'ohlcv.duckdb'
+# Research-only 1-min history (Massive + Robinhood). Kept out of ohlcv.duckdb so the
+# live Alpaca/Binance file stays lean and unlocked during long research backfills.
+OHLCV_RESEARCH_DUCKDB_PATH = Path(__file__).parent / 'data' / 'ohlcv_research.duckdb'
 OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'     # written by extraction.ohlcv.download_daily_1min — full universe incl. crypto
+OHLCV_MASSIVE_TABLE = 'massive_1min'
+OHLCV_ROBINHOOD_TABLE = 'robinhood_1min'
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 BATCH_SIZE = 100                                # tickers per yfinance download call
 
@@ -52,23 +57,33 @@ def _ohlcv_where_clause(tickers, start, end):
 
 
 def _connect_ohlcv_duckdb(read_only: bool = True):
-    """Opens data/ohlcv.duckdb, translating a lock conflict into a clear
-    error — shared by get_data()/get_data_duckdb() since both read this
-    single-writer file. The Massive backfill (extraction/ohlcv_massive.py)
-    holds an exclusive read-write connection for hours at a time while
-    running, and DuckDB refuses even a read-only connection concurrently
-    with it (verified: raises duckdb.IOException, not a silent/partial
-    read) — callers should expect this to raise while a backfill is
-    actively running and simply retry later."""
+    """Opens data/ohlcv.duckdb (live Alpaca/Binance + daily max tables)."""
     import duckdb
     try:
         return duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=read_only)
     except duckdb.IOException as e:
         raise RuntimeError(
-            'Could not open data/ohlcv.duckdb read-only — it is likely locked by a '
-            'currently-running Massive backfill (extraction/ohlcv_massive.py), which '
-            'holds an exclusive read-write connection while fetching. Wait for it to '
-            'finish (or pause it) and try again.'
+            'Could not open data/ohlcv.duckdb read-only — another process likely holds '
+            'a write lock. Wait for it to finish and try again.'
+        ) from e
+
+
+def _connect_ohlcv_research_duckdb(read_only: bool = True):
+    """Opens data/ohlcv_research.duckdb (massive_1min + robinhood_1min).
+
+    Massive/Robinhood backfills hold an exclusive write lock for hours; DuckDB
+    refuses even a concurrent read-only open (raises duckdb.IOException).
+    Callers should retry after the backfill finishes.
+    """
+    import duckdb
+    try:
+        return duckdb.connect(str(OHLCV_RESEARCH_DUCKDB_PATH), read_only=read_only)
+    except duckdb.IOException as e:
+        raise RuntimeError(
+            'Could not open data/ohlcv_research.duckdb read-only — it is likely locked by a '
+            'currently-running Massive/Robinhood backfill, which holds an exclusive '
+            'read-write connection while fetching. Wait for it to finish (or pause it) '
+            'and try again.'
         ) from e
 
 
@@ -147,20 +162,12 @@ _DUCKDB_SQL_PUSHDOWN_TICKER_THRESHOLD = 300
 def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, asvbt=False):
     """
     Same shape and params as get_data(), but sourced from
-    data/ohlcv.duckdb::massive_1min (the Massive equities/ETF backfill —
-    NOT the full ohlcv_1min.parquet universe; crypto isn't in this table)
-    instead of a parquet file. Filters are pushed down into SQL rather than
-    applied in pandas after loading, so this never reads the whole table
-    into memory — only the matching rows come across.
+    data/ohlcv_research.duckdb::massive_1min (the Massive equities/ETF
+    backfill — crypto isn't in this table). Filters are pushed down into SQL
+    rather than applied in pandas after loading.
 
-    Opens a fresh read-only connection per call rather than holding one
-    open, since data/ohlcv.duckdb is a single-writer file: the Massive
-    backfill (extraction/ohlcv_massive.py) holds an exclusive read-write
-    connection for hours at a time while running, and DuckDB does not allow
-    even a read-only connection to open concurrently with it (verified: it
-    raises duckdb.IOException, not a silent/partial read). Callers should
-    expect this to raise while a backfill is actively running and simply
-    retry later — see the raised error message.
+    Opens a fresh read-only connection per call. Expect this to raise while a
+    Massive/Robinhood backfill holds the research DB write lock — retry later.
 
     freq: resample the raw 1-min bars before returning. One of
     'hourly'/'daily'/'weekly'/'monthly', or any pandas offset alias (e.g. '15min').
@@ -210,15 +217,15 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
                 min(low) AS low,
                 arg_max(close, datetime) AS close,
                 sum(volume) AS volume
-            FROM massive_1min
+            FROM {OHLCV_MASSIVE_TABLE}
             {where_clause}
             GROUP BY ticker, {bucket}
             ORDER BY datetime
         '''
     else:
-        query = f'SELECT * FROM massive_1min {where_clause} ORDER BY datetime'
+        query = f'SELECT * FROM {OHLCV_MASSIVE_TABLE} {where_clause} ORDER BY datetime'
 
-    con = _connect_ohlcv_duckdb()
+    con = _connect_ohlcv_research_duckdb()
     per_ticker = _run_ohlcv_query(con, query, params)
 
     if freq is not None and not use_sql_pushdown:
@@ -246,20 +253,16 @@ def get_data_duckdb(tickers=None, start=None, end=None, freq=None, asdf=False, a
 
 def get_merged_close(tickers=None, start=None, end=None) -> pd.DataFrame:
     """
-    Stitches data/ohlcv.duckdb::massive_1min (the Massive equities/ETF
-    backfill, 2024-07-23 -> 2026-07-23) and ::robinhood_1min (the daily
-    incremental pull, 2026-07-22 onward) into one close-price matrix:
-    index=datetime, columns=ticker, values=close.
+    Stitches data/ohlcv_research.duckdb::massive_1min (Massive equities/ETF
+    backfill) and ::robinhood_1min (forward daily pull) into one close-price
+    matrix: index=datetime, columns=ticker, values=close.
 
-    Robinhood wins on the one-day overlap between the two tables (it's the
-    fresher/more-recently-verified source for that window) -- done via
-    ROW_NUMBER() partitioned on (datetime, ticker) rather than a plain
-    UNION, which would silently duplicate rows for that overlap.
+    Robinhood wins on the overlap between the two tables — done via
+    ROW_NUMBER() partitioned on (datetime, ticker) rather than a plain UNION.
 
     tickers/start/end filters are pushed into SQL, same as get_data_duckdb.
     Omitting tickers pulls the full ~2,300-symbol universe across the whole
-    history, which is a very wide/tall pivot -- scope down with `tickers`
-    or a `start` cutoff for interactive use.
+    history — scope down with `tickers` or a `start` cutoff for interactive use.
     """
     tickers = [tickers] if isinstance(tickers, str) else tickers
     where_clause, where_params = _ohlcv_where_clause(tickers, start, end)
@@ -268,11 +271,11 @@ def get_merged_close(tickers=None, start=None, end=None) -> pd.DataFrame:
     query = f'''
         WITH combined AS (
             SELECT datetime, ticker, close, 1 AS source_priority
-            FROM robinhood_1min
+            FROM {OHLCV_ROBINHOOD_TABLE}
             {where_clause}
             UNION ALL
             SELECT datetime, ticker, close, 0 AS source_priority
-            FROM massive_1min
+            FROM {OHLCV_MASSIVE_TABLE}
             {where_clause}
         ),
         deduped AS (
@@ -285,7 +288,7 @@ def get_merged_close(tickers=None, start=None, end=None) -> pd.DataFrame:
         SELECT datetime, ticker, close FROM deduped WHERE rn = 1 ORDER BY datetime
     '''
 
-    con = _connect_ohlcv_duckdb()
+    con = _connect_ohlcv_research_duckdb()
     try:
         df = con.execute(query, params).df()
     finally:

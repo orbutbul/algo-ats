@@ -2,7 +2,7 @@
 extraction/ohlcv_robinhood.py — 1-min equity/ETF OHLCV bars from Robinhood
 (via the Robinhood MCP trading server, reached directly through
 robinhood_client.RobinhoodMCPClient, bypassing Claude Code), written into
-data/ohlcv.duckdb::robinhood_1min. Two entry points:
+data/ohlcv_research.duckdb::robinhood_1min. Two entry points:
 
   - build_robinhood_ohlcv() — resumable historical backfill over an
     arbitrary date range, checkpointed with a per-ticker progress ledger
@@ -39,8 +39,7 @@ few deliberate differences:
 
 Does NOT touch crypto or the daily incremental Alpaca pull in
 extraction/ohlcv.py — this only backfills equity/ETF history from
-Robinhood. No --promote step: this only populates the robinhood_1min
-DuckDB table and stops there.
+Robinhood into the research DuckDB (separate from live ohlcv.duckdb).
 """
 
 import argparse
@@ -57,7 +56,7 @@ from robinhood_client import RobinhoodAuthError, RobinhoodMCPClient
 from utils import _tracked_symbols
 from validation import send_alert
 
-DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv.duckdb'
+DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_research.duckdb'
 STAGING_TABLE = 'robinhood_1min'
 PROGRESS_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_robinhood_progress.json'
 LAST_RUN_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_robinhood_last_run.txt'
@@ -221,10 +220,10 @@ def _connect() -> duckdb.DuckDBPyConnection:
 
 def _massive_last_date() -> date | None:
     """
-    Returns the most recent date in ohlcv.duckdb::massive_1min (None if the
-    DB/table doesn't exist or is empty) -- used as build_robinhood_ohlcv()'s
-    default start date, so the Robinhood backfill picks up right where the
-    Massive backfill's coverage ends rather than an arbitrary fixed lookback.
+    Returns the most recent date in ohlcv_research.duckdb::massive_1min
+    (None if the DB/table doesn't exist or is empty) — used as
+    build_robinhood_ohlcv()'s default start date so Robinhood picks up
+    where Massive coverage ends.
     """
     if not DUCKDB_PATH.exists():
         return None
@@ -373,7 +372,7 @@ def build_robinhood_ohlcv(tickers: list[str] | None = None, start: date | None =
 def download_daily_robinhood(tickers: list[str] | None = None) -> None:
     """
     Pulls today's day of 1-min bars (bounds=RH_BOUNDS) for `tickers`
-    (default: tracked equities + ETFs) into data/ohlcv.duckdb::robinhood_1min,
+    (default: tracked equities + ETFs) into data/ohlcv_research.duckdb::robinhood_1min,
     deleting-then-reinserting only the exact (datetime, ticker) rows being
     written -- same dedup pattern as extraction.ohlcv.download_daily_1min --
     so re-running the same day is always safe.

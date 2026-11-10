@@ -47,10 +47,10 @@ REMOTE_REPO_DIR = 'ATS_trading'  # ~/ATS_trading on the VM
 DB_SPECS: dict[str, dict[str, list[str]]] = {
     'news.duckdb': {name: spec['dedup_cols'] for name, spec in NEWS_TABLES.items()},
     'ohlcv.duckdb': {
+        # Live / scheduled path only. Research 1-min history (massive_1min,
+        # robinhood_1min) lives in data/ohlcv_research.duckdb and is local-only.
         'ohlcv_1min_airflow': ['datetime', 'ticker'],  # extraction/ohlcv.py::OHLCV_AIRFLOW_TABLE
         'ohlcv_max_daily': ['datetime', 'ticker'],      # extraction/ohlcv.py::OHLCV_MAX_TABLE
-        'robinhood_1min': ['datetime', 'ticker'],        # extraction/ohlcv_robinhood.py::STAGING_TABLE
-        'massive_1min': ['datetime', 'ticker'],          # extraction/ohlcv_massive.py::STAGING_TABLE
     },
 }
 

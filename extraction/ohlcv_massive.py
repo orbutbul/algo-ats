@@ -3,20 +3,14 @@ extraction/ohlcv_massive.py — one-off historical backfill of 1-min equity/ETF
 OHLCV bars from Massive (formerly Polygon.io), replacing the sparse
 Alpaca/IEX-sourced history. Rate-limited to the free tier's 5 calls/min,
 resumable via a per-ticker progress ledger, checkpointed into a DuckDB
-staging table (data/ohlcv.duckdb::massive_1min). Run manually:
+staging table (data/ohlcv_research.duckdb::massive_1min). Run manually:
 `python -m extraction.ohlcv_massive`.
 
-DuckDB (not parquet) is the staging store specifically so each checkpoint can
-append a batch with a real INSERT rather than reading the entire
-already-accumulated dataset into memory, concatenating, and rewriting it —
-that read-modify-write pattern was the cause of severe memory pressure once
-the staging data grew into the multiple-GB range.
+Lives in ohlcv_research.duckdb (not ohlcv.duckdb) so long backfills do not
+lock the live Alpaca/Binance store. DuckDB is used so each checkpoint can
+INSERT a batch without reading the whole history into memory.
 
-Does NOT touch crypto (already ~100% complete via Binance) or the daily
-incremental Alpaca pull in extraction/ohlcv.py — this only rebuilds
-equity/ETF *history*, staged into data/ohlcv.duckdb::massive_1min and left
-there (no promotion into a parquet snapshot — see extraction/ohlcv.py and
-extraction/ohlcv_robinhood.py for the same DuckDB-only convention).
+Does NOT touch crypto or the daily Alpaca pull in extraction/ohlcv.py.
 """
 
 import argparse
@@ -39,7 +33,7 @@ load_dotenv()
 MASSIVE_API_BASE = 'https://api.massive.com'
 MASSIVE_RATE_LIMIT_CALLS_PER_MIN = 5  # free tier
 MASSIVE_MAX_BARS_PER_CALL = 50_000
-DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv.duckdb'
+DUCKDB_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_research.duckdb'
 STAGING_TABLE = 'massive_1min'
 PROGRESS_PATH = Path(__file__).parent.parent / 'data' / 'ohlcv_massive_progress.json'
 DEFAULT_START = date(2024, 7, 23)

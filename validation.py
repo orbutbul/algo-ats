@@ -24,12 +24,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from extraction.fundamentals import FUNDAMENTALS_DIR, FUNDAMENTALS_SPECS
+from extraction.fundamentals import FUNDAMENTALS_DB_PATH, FUNDAMENTALS_SPECS
 from extraction.wsb import WSB_DB_PATH
 from extraction.news import NEWS_DB_PATH
 
 OHLCV_DUCKDB_PATH = Path('data/ohlcv.duckdb')
+OHLCV_RESEARCH_DUCKDB_PATH = Path('data/ohlcv_research.duckdb')
 OHLCV_AIRFLOW_TABLE = 'ohlcv_1min_airflow'
+OHLCV_RESEARCH_TABLES = frozenset({'massive_1min', 'robinhood_1min'})
 
 # Fraction of Close/Volume that may be null in today's rows before flagging.
 OHLCV_NULL_FRACTION_THRESHOLD = 0.05
@@ -99,21 +101,25 @@ def validate_screen(screen: dict) -> list[str]:
     return []
 
 
+def _ohlcv_db_for_table(table: str) -> Path:
+    return OHLCV_RESEARCH_DUCKDB_PATH if table in OHLCV_RESEARCH_TABLES else OHLCV_DUCKDB_PATH
+
+
 def validate_ohlcv(screen: dict, run_date: date | None = None, table: str = OHLCV_AIRFLOW_TABLE) -> list[str]:
-    """Checks `table` in data/ohlcv.duckdb for `run_date` rows with an
-    acceptable close/volume null rate. `table` defaults to the Alpaca
-    ohlcv_1min_airflow table; pass table='robinhood_1min' (or any other
-    table sharing the same datetime/close/volume columns) to validate a
-    different source instead."""
+    """Checks `table` for `run_date` rows with an acceptable close/volume
+    null rate. Defaults to data/ohlcv.duckdb::ohlcv_1min_airflow. Pass
+    table='robinhood_1min' / 'massive_1min' to validate the research DB
+    (data/ohlcv_research.duckdb) instead."""
     run_date = run_date or datetime.now(timezone.utc).date()
     if not is_market_day(run_date):
         return []
 
-    label = f'{OHLCV_DUCKDB_PATH}::{table}'
-    if not OHLCV_DUCKDB_PATH.exists():
+    db_path = _ohlcv_db_for_table(table)
+    label = f'{db_path}::{table}'
+    if not db_path.exists():
         return [f'{label} does not exist']
 
-    con = duckdb.connect(str(OHLCV_DUCKDB_PATH), read_only=True)
+    con = duckdb.connect(str(db_path), read_only=True)
     try:
         tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
         if table not in tables:
@@ -137,17 +143,29 @@ def validate_ohlcv(screen: dict, run_date: date | None = None, table: str = OHLC
 
 
 def validate_fundamentals(screen: dict, specs: dict = FUNDAMENTALS_SPECS) -> list[str]:
+    """Checks database/fundamentals.duckdb for a non-empty table per
+    asset_class/freq present in `screen`."""
     issues = []
-    for asset_class, freq_map in specs.items():
-        if not screen.get(asset_class):
-            continue
-        for freq in freq_map:
-            path = FUNDAMENTALS_DIR / f'{asset_class}_{freq}.parquet'
-            if not path.exists():
-                issues.append(f'{path} does not exist')
+    if not FUNDAMENTALS_DB_PATH.exists():
+        return [f'{FUNDAMENTALS_DB_PATH} does not exist']
+
+    con = duckdb.connect(str(FUNDAMENTALS_DB_PATH), read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        for asset_class, freq_map in specs.items():
+            if not screen.get(asset_class):
                 continue
-            if len(pd.read_parquet(path)) == 0:
-                issues.append(f'{path} exists but has 0 rows')
+            for freq in freq_map:
+                table = f'{asset_class}_{freq}'
+                label = f'{FUNDAMENTALS_DB_PATH}::{table}'
+                if table not in tables:
+                    issues.append(f'{label} does not exist')
+                    continue
+                n = con.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                if n == 0:
+                    issues.append(f'{label} exists but has 0 rows')
+    finally:
+        con.close()
     return issues
 
 

@@ -3,7 +3,7 @@ from yfinance import EquityQuery
 import pandas as pd
 import requests
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import time
 from pathlib import Path
 from tradingview_screener import Query, col
@@ -14,9 +14,17 @@ from utils import *
 
 # --- Paths ---
 OHLCV_PATH = Path('data/ohlcv_1min.parquet')   # 1-minute OHLCV bars for all asset classes
-FUNDAMENTALS_DIR = Path('data/fundamentals')    # one parquet per {asset_class}_{freq}
+# DuckDB under database/ is the primary fundamentals store (PE + other equity
+# fields, plus ETF/crypto tables). Legacy parquet under data/fundamentals/ is
+# still readable by the one-shot migrator in scripts/migrate_data_stores.py.
+DATABASE_DIR = Path('database')
+FUNDAMENTALS_DB_PATH = DATABASE_DIR / 'fundamentals.duckdb'
+FUNDAMENTALS_DIR = DATABASE_DIR / 'cache'  # CoinGecko side JSON, not the main store
+# Kept for validate_fundamentals / migrator imports that still name the old path.
+LEGACY_FUNDAMENTALS_DIR = Path('data/fundamentals')
 
 OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
+EQUITIES_WIDE_TABLE = 'equities'  # joined daily+weekly+monthly snapshot incl. PE
 
 # --- Fundamental field lists ---
 # Fields are grouped by how often they meaningfully change.
@@ -258,13 +266,162 @@ def fetch_crypto_fundamentals(binance_symbols: list[str], force: bool = False) -
     return pd.DataFrame(rows).set_index('ticker')
 
 
-def _needs_update(path: Path, freq: str) -> bool:
-    """True if the parquet is missing or older than the staleness threshold for freq."""
-    if not path.exists():
+def _table_name(asset_class: str, freq: str) -> str:
+    return f'{asset_class}_{freq}'
+
+
+def _connect_fundamentals_db(read_only: bool = False):
+    import duckdb
+    FUNDAMENTALS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return duckdb.connect(str(FUNDAMENTALS_DB_PATH), read_only=read_only)
+
+
+def _load_fundamentals_table(asset_class: str, freq: str) -> pd.DataFrame | None:
+    """Returns the cached table as a ticker-indexed DataFrame, or None if missing."""
+    if not FUNDAMENTALS_DB_PATH.exists():
+        return None
+    table = _table_name(asset_class, freq)
+    con = _connect_fundamentals_db(read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if table not in tables:
+            return None
+        df = con.execute(f'SELECT * FROM {table}').df()
+    finally:
+        con.close()
+    if df.empty or 'ticker' not in df.columns:
+        return None
+    return df.set_index('ticker')
+
+
+def _table_as_of(asset_class: str, freq: str) -> date | None:
+    """Latest as_of date stored in the table, or None if missing/empty."""
+    if not FUNDAMENTALS_DB_PATH.exists():
+        return None
+    table = _table_name(asset_class, freq)
+    con = _connect_fundamentals_db(read_only=True)
+    try:
+        tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+        if table not in tables:
+            return None
+        cols = {r[0] for r in con.execute(f'DESCRIBE {table}').fetchall()}
+        if 'as_of' not in cols:
+            return None
+        row = con.execute(f'SELECT MAX(as_of) FROM {table}').fetchone()
+    finally:
+        con.close()
+    if not row or row[0] is None:
+        return None
+    val = row[0]
+    return val.date() if hasattr(val, 'date') else pd.Timestamp(val).date()
+
+
+def _needs_update(asset_class: str, freq: str) -> bool:
+    """True if the DuckDB table is missing or older than the staleness threshold."""
+    as_of = _table_as_of(asset_class, freq)
+    if as_of is None:
         return True
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).date()
     today = datetime.now(timezone.utc).date()
-    return (today - mtime).days >= FREQ_STALENESS_DAYS.get(freq, 1)
+    return (today - as_of).days >= FREQ_STALENESS_DAYS.get(freq, 1)
+
+
+def _save_fundamentals_table(asset_class: str, freq: str, df: pd.DataFrame) -> None:
+    """Replace-write one {asset}_{freq} table and refresh the equities wide view."""
+    table = _table_name(asset_class, freq)
+    out = df.reset_index() if df.index.name == 'ticker' or 'ticker' in (df.index.names or []) else df.copy()
+    if 'ticker' not in out.columns:
+        out = out.rename_axis('ticker').reset_index()
+    out['as_of'] = datetime.now(timezone.utc)
+
+    con = _connect_fundamentals_db(read_only=False)
+    try:
+        con.register('_fund_new', out)
+        con.execute(f'CREATE OR REPLACE TABLE {table} AS SELECT * FROM _fund_new')
+        con.unregister('_fund_new')
+        if asset_class == 'equities':
+            _refresh_equities_wide(con)
+    finally:
+        con.close()
+
+
+def _refresh_equities_wide(con) -> None:
+    """Build database/fundamentals.duckdb::equities — PE + other equity fields joined."""
+    tables = {r[0] for r in con.execute('SHOW TABLES').fetchall()}
+    aliases = []
+    for freq, alias in (('daily', 'd'), ('weekly', 'w'), ('monthly', 'm')):
+        name = _table_name('equities', freq)
+        if name in tables:
+            aliases.append((alias, name, freq))
+    if not aliases:
+        return
+
+    select_cols = [
+        'COALESCE(' + ', '.join(f'{a}.ticker' for a, _, _ in aliases) + ') AS ticker'
+    ]
+    for alias, name, freq in aliases:
+        cols = [r[0] for r in con.execute(f'DESCRIBE {name}').fetchall()]
+        for col in cols:
+            if col in ('ticker', 'as_of'):
+                continue
+            select_cols.append(f'{alias}.{col} AS {col}')
+        if 'as_of' in cols:
+            select_cols.append(f'{alias}.as_of AS {freq}_as_of')
+
+    first_alias, first_name, _ = aliases[0]
+    from_sql = f'{first_name} {first_alias}'
+    ticker_expr = f'{first_alias}.ticker'
+    for alias, name, _ in aliases[1:]:
+        from_sql += (
+            f' FULL OUTER JOIN {name} {alias} ON {ticker_expr} = {alias}.ticker'
+        )
+        ticker_expr = f'COALESCE({ticker_expr}, {alias}.ticker)'
+
+    con.execute(f'''
+        CREATE OR REPLACE TABLE {EQUITIES_WIDE_TABLE} AS
+        SELECT {', '.join(select_cols)}
+        FROM {from_sql}
+    ''')
+
+
+def import_pe_snapshot(path: Path, merge: bool = True) -> int:
+    """
+    Load a PE/growth CSV (or .csv.gz) into equities_monthly / equities wide table.
+
+    Expected columns (subset ok): ticker, trailingPE, forwardPE, revenueGrowth,
+    earningsGrowth, debtToEquity, grossMargins, returnOnEquity — the same set
+    as EQUITY_MONTHLY_FIELDS (minus enterpriseToEbitda / freeCashflow if absent).
+
+    merge=True upserts by ticker into equities_monthly; False replaces the table.
+    Returns number of rows written.
+    """
+    path = Path(path)
+    df = pd.read_csv(path)
+    if 'ticker' not in df.columns:
+        raise ValueError(f'{path} has no ticker column')
+    df = df.set_index('ticker')
+    keep = [c for c in EQUITY_MONTHLY_FIELDS if c in df.columns]
+    if not keep:
+        raise ValueError(f'{path} has none of {EQUITY_MONTHLY_FIELDS}')
+    df = df[keep]
+
+    if merge:
+        existing = _load_fundamentals_table('equities', 'monthly')
+        if existing is not None:
+            # Prefer snapshot values for overlapping columns; keep other monthly fields.
+            combined = existing.copy()
+            for col in keep:
+                combined[col] = df[col].combine_first(combined[col]) if col in combined.columns else df[col]
+            for col in keep:
+                if col not in combined.columns:
+                    combined[col] = df[col]
+            # Tickers only in the snapshot
+            only_new = df.index.difference(combined.index)
+            if len(only_new):
+                combined = pd.concat([combined, df.loc[only_new]])
+            df = combined
+
+    _save_fundamentals_table('equities', 'monthly', df)
+    return len(df)
 
 
 def _fetch_fields(tickers: list[str], fields: list[str], delay: float = 0.5, retries: int = 3) -> pd.DataFrame:
@@ -318,9 +475,11 @@ def fundamentals(symbols: dict, specs: dict = FUNDAMENTALS_SPECS, force: bool = 
 
     Returns {'equities': {'daily': df, 'weekly': df, ...}, 'etfs': {...}, ...}.
     Each df is indexed by ticker with one column per field.
-    Results are cached to data/fundamentals/{asset_class}_{freq}.parquet.
+    Results are cached in database/fundamentals.duckdb as {asset}_{freq} tables.
+    Equity refreshes also rebuild the wide `equities` table (PE + other fields).
     """
     FUNDAMENTALS_DIR.mkdir(parents=True, exist_ok=True)
+    DATABASE_DIR.mkdir(parents=True, exist_ok=True)
     results = {}
 
     for asset_class, freq_map in specs.items():
@@ -329,19 +488,21 @@ def fundamentals(symbols: dict, specs: dict = FUNDAMENTALS_SPECS, force: bool = 
             continue
         results[asset_class] = {}
         for freq, fields in freq_map.items():
-            path = FUNDAMENTALS_DIR / f'{asset_class}_{freq}.parquet'
-            if not force and not _needs_update(path, freq):
-                results[asset_class][freq] = pd.read_parquet(path)
-                print(f'{asset_class}/{freq}: loaded cache ({path})')
-                continue
+            table = _table_name(asset_class, freq)
+            if not force and not _needs_update(asset_class, freq):
+                cached = _load_fundamentals_table(asset_class, freq)
+                if cached is not None:
+                    results[asset_class][freq] = cached
+                    print(f'{asset_class}/{freq}: loaded cache ({FUNDAMENTALS_DB_PATH}::{table})')
+                    continue
             print(f'{asset_class}/{freq}: fetching {len(fields)} fields for {len(tickers)} tickers...')
             if asset_class == 'cryptos':
                 df = fetch_crypto_fundamentals(tickers, force=force)
                 df = df[[f for f in fields if f in df.columns]]
             else:
                 df = _fetch_fields(tickers, fields)
-            df.to_parquet(path)
-            print(f'{asset_class}/{freq}: saved {len(df)} rows to {path}')
+            _save_fundamentals_table(asset_class, freq, df)
+            print(f'{asset_class}/{freq}: saved {len(df)} rows to {FUNDAMENTALS_DB_PATH}::{table}')
             results[asset_class][freq] = df
 
     return results
