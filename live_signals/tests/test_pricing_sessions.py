@@ -47,8 +47,12 @@ def test_hold_policy():
     assert must_flatten_for_clock(
         et(2026, 11, 12, 15, 49), 80, overnight_min_score=85, minutes_before_close=10,
     ) is None
+    # 85 is not above the threshold, so it does not stay overnight. 86 does.
     assert must_flatten_for_clock(
         et(2026, 11, 12, 15, 50), 85, overnight_min_score=85, minutes_before_close=10,
+    ) == "eod_flat"
+    assert must_flatten_for_clock(
+        et(2026, 11, 12, 15, 50), 86, overnight_min_score=85, minutes_before_close=10,
     ) is None
     assert must_flatten_for_clock(
         et(2026, 11, 13, 15, 50), 95, overnight_min_score=85, minutes_before_close=10,

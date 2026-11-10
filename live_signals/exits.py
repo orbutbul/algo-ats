@@ -21,7 +21,7 @@ from live_signals.events import position_event_action, tightened_stop
 from live_signals.models import Confirmation, NewsSignal, PositionState, PriceBar, ScheduledEvent
 from live_signals.pricing import round_shares
 from live_signals.qualify import is_confirmed, source_block_reason, source_facts
-from live_signals.sessions import must_flatten_for_clock, session_hours_between, to_et
+from live_signals.sessions import must_flatten_for_clock, session_hours_between
 
 
 class ExitDecision:
@@ -97,8 +97,12 @@ def _signal_exit(
         age = now - signal.timestamp
         if age < -timedelta(minutes=cfg.clock_skew_minutes) or age > fresh_cutoff:
             continue
-        if signal.direction == "neutral" and signal.score >= cfg.neutral_exit_score:
-            return "signal_invalidated"
+        # A fresh print under hold_until_score closes the position whether or
+        # not the wording is still bullish. Above that, the position stays.
+        if signal.score < cfg.hold_until_score:
+            return "score_below_hold"
+        if signal.direction == "neutral":
+            continue
         if signal.direction not in ("long", "short") or signal.direction == position.side:
             continue
         n_domains, institutional = source_facts(signal, cfg)
@@ -111,23 +115,32 @@ def _signal_exit(
     return None
 
 
+def _tight_trail(position: PositionState, cfg: Config) -> bool:
+    """Score at or below the overnight threshold uses a 2% trail from the high."""
+    return position.entry_score <= cfg.overnight_min_score
+
+
 def _update_trail(position: PositionState, bar: PriceBar, cfg: Config) -> PositionState:
     if position.side == "long":
         extreme = bar.high
         mfe = max(position.mfe_r, _favorable(position, extreme))
         watermark = max(position.watermark, extreme)
-        armed = position.trail_armed or mfe >= cfg.trail_arm_r
+        armed = position.trail_armed or mfe >= cfg.trail_arm_r or _tight_trail(position, cfg)
         stop = position.stop
-        if armed and position.atr > 0:
+        if _tight_trail(position, cfg):
+            stop = max(stop, watermark * (1 - cfg.low_score_trail_pct))
+        elif armed and position.atr > 0:
             distance = max(cfg.trail_atr_mult * position.atr, cfg.trail_min_fraction_of_r * position.r)
             stop = max(stop, watermark - distance)
         return position.evolve(mfe_r=mfe, watermark=watermark, trail_armed=armed, stop=stop)
     extreme = bar.low
     mfe = max(position.mfe_r, _favorable(position, extreme))
     watermark = min(position.watermark, extreme)
-    armed = position.trail_armed or mfe >= cfg.trail_arm_r
+    armed = position.trail_armed or mfe >= cfg.trail_arm_r or _tight_trail(position, cfg)
     stop = position.stop
-    if armed and position.atr > 0:
+    if _tight_trail(position, cfg):
+        stop = min(stop, watermark * (1 + cfg.low_score_trail_pct))
+    elif armed and position.atr > 0:
         distance = max(cfg.trail_atr_mult * position.atr, cfg.trail_min_fraction_of_r * position.r)
         stop = min(stop, watermark + distance)
     return position.evolve(mfe_r=mfe, watermark=watermark, trail_armed=armed, stop=stop)
@@ -139,21 +152,6 @@ def _slice(basis: int, fraction: float, current: int) -> int:
         return 0
     raw = max(1, round_shares(basis * fraction))
     return min(raw, current - 1)
-
-
-def _preopen_underwater(position: PositionState, now: datetime, cfg: Config, last: float) -> bool:
-    """Low-conviction positions opened outside RTH are flattened if still red just before the open."""
-    if position.entry_session == "rth" or position.entry_score >= cfg.overnight_min_score:
-        return False
-    et = to_et(now)
-    if et.weekday() >= 5:
-        return False
-    clock = et.timetz().replace(tzinfo=None)
-    if not (cfg.preopen_flatten_start <= clock < cfg.preopen_flatten_end):
-        return False
-    if position.side == "long":
-        return last < position.entry_price
-    return last > position.entry_price
 
 
 def evaluate_exit(
@@ -185,10 +183,6 @@ def evaluate_exit(
     if clock:
         return ExitDecision("exit", clock, position.qty, position)
 
-    mark = bar.close if last_price is None else last_price
-    if _preopen_underwater(position, now, cfg, mark):
-        return ExitDecision("exit", "preopen_flat", position.qty, position)
-
     event_action = position_event_action(now, position, events, cfg)
     if event_action in ("earnings_flat", "macro_flat"):
         return ExitDecision("exit", event_action, position.qty, position)
@@ -197,17 +191,17 @@ def evaluate_exit(
     if signal_reason:
         return ExitDecision("exit", signal_reason, position.qty, position)
 
-    wall_hours = (now - position.entry_time).total_seconds() / 3600
-    if wall_hours >= cfg.max_hold_hours:
-        return ExitDecision("exit", "time_stop", position.qty, position)
-
-    open_hours = session_hours_between(position.entry_time, now, holidays, early_closes)
     extreme = bar.high if position.side == "long" else bar.low
     mfe_now = max(position.mfe_r, _favorable(position, extreme))
-    # The session-hour sum is a five-minute walk, so an exact N-hour span can
-    # land a fraction of a microsecond short. Treat that as N hours.
-    if open_hours + 1e-6 >= cfg.alpha_decay_hours and mfe_now < cfg.alpha_decay_min_mfe_r:
-        return ExitDecision("exit", "alpha_decay", position.qty, position.evolve(mfe_r=mfe_now))
+    if cfg.time_exits_enabled:
+        # Off by default. A position stays open until a fresh score is under
+        # hold_until_score, or a stop / daily-loss halt fires.
+        wall_hours = (now - position.entry_time).total_seconds() / 3600
+        if wall_hours >= cfg.max_hold_hours:
+            return ExitDecision("exit", "time_stop", position.qty, position.evolve(mfe_r=mfe_now))
+        open_hours = session_hours_between(position.entry_time, now, holidays, early_closes)
+        if open_hours + 1e-6 >= cfg.alpha_decay_hours and mfe_now < cfg.alpha_decay_min_mfe_r:
+            return ExitDecision("exit", "alpha_decay", position.qty, position.evolve(mfe_r=mfe_now))
 
     updated = _update_trail(position, bar, cfg)
     reason = "hold"

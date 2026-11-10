@@ -51,6 +51,14 @@ class WirewatchPushSource:
         return []
 
 
+class EmptyMarketSource:
+    """No local quote file. `enrich_market` then loads Alpaca or Yahoo."""
+
+    def fetch(self, now: datetime) -> MarketSnapshot:
+        del now
+        return MarketSnapshot()
+
+
 class JsonFileMarketSource:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)

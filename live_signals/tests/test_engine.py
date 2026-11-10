@@ -11,7 +11,7 @@ from live_signals.config import config_with, default_config
 from live_signals.engine import Engine
 from live_signals.errors import AccountGuardError
 from live_signals.journal import DecisionLog
-from live_signals.models import MarketSnapshot, OrderRequest, PositionState, PriceBar, Quote, new_book
+from live_signals.models import MarketSnapshot, OrderRequest, PositionState, PriceBar, Quote, VolSnapshot, new_book
 from live_signals.notify import MemoryNotifier
 from live_signals.state import StateStore
 from live_signals.tests.conftest import et, flat_bar, quote, signal, snapshot
@@ -310,3 +310,33 @@ def test_cli_is_log_only(tmp_path, monkeypatch):
         max_cycles=2,
     )
     assert sleeps == [engine.config.poll_seconds]
+
+
+def test_static_sector_cap_applies_without_a_feed(tmp_path):
+    engine = _engine(tmp_path)
+    book = new_book(15_000).evolve(
+        cash=11_000,
+        positions={
+            "MSFT": PositionState(
+                ticker="MSFT", side="long", qty=40, entry_price=100, entry_time=NOW,
+                entry_score=90, signal_id="msft", initial_stop=94, stop=94, atr=4, r=6,
+                watermark=100, trail_armed=False, tp1_done=False, tp2_done=False,
+                target_qty=40, tranche2_qty=0, tranche2_deadline=None, tranche2_sent=True,
+                adopted=False, entry_session="rth", mfe_r=0, basis_qty=40,
+            ),
+        },
+    )
+    engine.state.save(book)
+    market = MarketSnapshot(
+        quotes={"AAPL": quote(100), "MSFT": quote(100)},
+        vols={
+            "AAPL": VolSnapshot(4, 100),
+            "MSFT": VolSnapshot(4, 100),
+        },
+    )
+    decisions = engine.run_once(NOW, [signal(now=NOW)], market)
+    take = next(row for row in decisions if row.action == "take")
+    # Technology cap is 30% of $15k = $4,500. MSFT already uses $4,000, so AAPL
+    # is cut to a $500 target (5 shares) before the 60% scale-in clip.
+    assert take.details["binding"] == "sector"
+    assert take.details["target_qty"] == 5

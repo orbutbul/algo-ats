@@ -21,7 +21,8 @@ from live_signals.config import load_config, replace_config
 from live_signals.engine import Engine
 from live_signals.journal import DecisionLog
 from live_signals.notify import MemoryNotifier
-from live_signals.sources import JsonFileMarketSource, JsonFileSignalSource
+from live_signals.marketdata import enrich_market
+from live_signals.sources import EmptyMarketSource, JsonFileMarketSource, JsonFileSignalSource
 from live_signals.state import StateStore
 
 
@@ -49,7 +50,9 @@ def run_loop(engine: Engine, signals: JsonFileSignalSource, market: JsonFileMark
     completed = 0
     while max_cycles is None or completed < max_cycles:
         now = clock()
-        engine.run_once(now, signals.fetch(now), market.fetch(now))
+        batch = signals.fetch(now)
+        snapshot = enrich_market(market.fetch(now), [item.ticker for item in batch], now)
+        engine.run_once(now, batch, snapshot)
         completed += 1
         if max_cycles is not None and completed >= max_cycles:
             break
@@ -60,7 +63,10 @@ def run_loop(engine: Engine, signals: JsonFileSignalSource, market: JsonFileMark
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Wirewatch live-signal log-only loop")
     parser.add_argument("--signals", required=True, help="Wirewatch JSON file, re-read each poll")
-    parser.add_argument("--market", required=True, help="Quotes, ATR, events JSON file")
+    parser.add_argument(
+        "--market", default=None,
+        help="Optional quotes/ATR JSON. Tickers missing from it are loaded from Alpaca, then Yahoo.",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--state", default=None)
     parser.add_argument("--log", default=None)
@@ -74,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     run_loop(
         engine,
         JsonFileSignalSource(args.signals),
-        JsonFileMarketSource(args.market),
+        JsonFileMarketSource(args.market) if args.market else EmptyMarketSource(),
         sleep=time.sleep,
         clock=lambda: datetime.now(timezone.utc),
         max_cycles=cycles,

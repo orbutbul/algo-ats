@@ -128,15 +128,18 @@ def must_flatten_for_clock(
     """Return `weekend_flat` or `eod_flat` when a position should not be held, else None.
 
     Friday at the flatten deadline, Saturday, and Sunday before 20:00 are
-    always flat. Other days: a score below `overnight_min_score`, or a night
-    whose overnight session is closed, is flattened from the deadline onward.
+    always flat, because that overnight session does not run. A scored name
+    at or below `overnight_min_score` is also flat from the deadline onward
+    (a 2% trail covers it during the day). Score must be strictly above the
+    threshold to be held overnight. A score of 0 means the position was
+    adopted with no Wirewatch score, so the clock does not force it out.
     """
     holidays = holidays or set()
     et = to_et(moment)
     clock = et.timetz().replace(tzinfo=None)
     weekday = et.weekday()
     session = classify_session(moment, holidays, early_closes)
-    low = entry_score < overnight_min_score
+    low = 0 < entry_score <= overnight_min_score
     deadline = flatten_deadline(moment, early_closes, minutes_before_close)
 
     if weekday == 5 or (weekday == 6 and clock < time(20, 0)):

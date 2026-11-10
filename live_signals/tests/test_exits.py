@@ -2,6 +2,9 @@
 
 from datetime import timedelta
 
+import pytest
+
+from live_signals.config import config_with
 from live_signals.exits import evaluate_exit
 from live_signals.models import PositionState, PriceBar, ScheduledEvent, SignalSource
 from live_signals.tests.conftest import et, quote, signal
@@ -26,6 +29,15 @@ def _exit(cfg, pos, bar, now, signals=None, events=(), **kwargs):
         pos, bar, now, signals or [], events, cfg,
         last_price=kwargs.pop("last", bar.close), **kwargs,
     )
+
+
+def test_low_score_uses_a_two_percent_trail(cfg):
+    # Score 80 does not get the ATR trail. The stop ratchets to 2% under the high.
+    first = _exit(cfg, _pos(entry_score=80), PriceBar(100, 99, 100), et(2026, 11, 9, 12, 0))
+    assert first.action == "hold"
+    assert first.position.stop == pytest.approx(98)  # 100 * 0.98, tighter than the ATR stop at 94
+    second = _exit(cfg, first.position, PriceBar(100, 98, 99), et(2026, 11, 9, 12, 10))
+    assert second.reason == "trail_stop"
 
 
 def test_stop_and_short_stop(cfg):
@@ -61,12 +73,16 @@ def test_scale_out_levels(cfg):
 
 
 def test_time_stop_and_alpha_decay(cfg):
-    faded = _exit(cfg, _pos(mfe_r=0.2), PriceBar(100, 99, 100), et(2026, 11, 9, 18, 0))
+    # Default config keeps the position open until a score print under 60.
+    held = _exit(cfg, _pos(mfe_r=0.2), PriceBar(100, 99, 100), et(2026, 11, 9, 18, 0))
+    assert held.action == "hold"
+    timed = config_with(time_exits_enabled=True)
+    faded = _exit(timed, _pos(mfe_r=0.2), PriceBar(100, 99, 100), et(2026, 11, 9, 18, 0))
     assert faded.reason == "alpha_decay"
-    worked = _exit(cfg, _pos(mfe_r=0.4), PriceBar(100, 99, 100), et(2026, 11, 9, 18, 0))
+    worked = _exit(timed, _pos(mfe_r=0.4), PriceBar(100, 99, 100), et(2026, 11, 9, 18, 0))
     assert worked.reason != "alpha_decay"
     old = _pos(entry_time=et(2026, 11, 11, 12, 0), entry_score=90, mfe_r=1.0)
-    stopped = _exit(cfg, old, PriceBar(101, 100, 101), et(2026, 11, 13, 0, 30))
+    stopped = _exit(timed, old, PriceBar(101, 100, 101), et(2026, 11, 13, 0, 30))
     assert stopped.reason == "time_stop"
 
 
@@ -75,12 +91,9 @@ def test_clock_flattens(cfg):
     thu = et(2026, 11, 12, 10, 0)
     fri = et(2026, 11, 13, 10, 0)
     assert _exit(cfg, _pos(entry_score=80, entry_time=thu), PriceBar(100, 99, 100), et(2026, 11, 12, 15, 50)).reason == "eod_flat"
-    assert _exit(cfg, _pos(entry_score=85, entry_time=thu), PriceBar(100, 99, 100), et(2026, 11, 12, 15, 50)).action == "hold"
+    assert _exit(cfg, _pos(entry_score=85, entry_time=thu), PriceBar(100, 99, 100), et(2026, 11, 12, 15, 50)).reason == "eod_flat"
+    assert _exit(cfg, _pos(entry_score=86, entry_time=thu), PriceBar(100, 99, 100), et(2026, 11, 12, 15, 50)).action == "hold"
     assert _exit(cfg, _pos(entry_score=95, entry_time=fri), PriceBar(100, 99, 100), et(2026, 11, 13, 15, 50)).reason == "weekend_flat"
-    pre = _pos(entry_score=80, entry_session="pre", entry_price=100)
-    assert _exit(cfg, pre, PriceBar(99, 98, 99), et(2026, 11, 9, 9, 25)).reason == "preopen_flat"
-    assert _exit(cfg, pre, PriceBar(101, 100.5, 101), et(2026, 11, 9, 9, 25)).action == "hold"
-    assert _exit(cfg, _pos(entry_score=80), PriceBar(99, 98, 99), et(2026, 11, 9, 9, 25)).action == "hold"
 
 
 def test_events(cfg):
@@ -105,7 +118,9 @@ def test_signal_reversal_requires_a_qualified_opposite(cfg):
     weaker = signal(score=75, sentiment="bearish", signal_id="weaker", now=now)
     assert _exit(cfg, _pos(entry_score=90), PriceBar(100, 99, 100), now, [weaker]).action == "hold"
     neutral = signal(score=75, sentiment="neutral", signal_id="flat", now=now)
-    assert _exit(cfg, _pos(), PriceBar(100, 99, 100), now, [neutral]).reason == "signal_invalidated"
+    assert _exit(cfg, _pos(), PriceBar(100, 99, 100), now, [neutral]).action == "hold"
+    faded = signal(score=59, sentiment="bullish", signal_id="faded", now=now)
+    assert _exit(cfg, _pos(), PriceBar(100, 99, 100), now, [faded]).reason == "score_below_hold"
     stale = signal(score=90, sentiment="bearish", signal_id="old", now=now, minutes_ago=90)
     assert _exit(cfg, _pos(entry_score=70), PriceBar(100, 99, 100), now, [stale]).action == "hold"
     # keep the import used when a test wants a quote-shaped last

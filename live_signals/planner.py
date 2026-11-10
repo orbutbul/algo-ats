@@ -42,6 +42,7 @@ from live_signals.pricing import (
 )
 from live_signals.qualify import ambiguous_ids, qualify_signal
 from live_signals.risk import step_risk
+from live_signals.sectors import sector_of
 from live_signals.sessions import classify_session, must_flatten_for_clock
 from live_signals.sizing import size_target_with_cluster, stop_distance
 
@@ -81,7 +82,8 @@ def _exposures(positions: dict[str, PositionState], market: MarketSnapshot, skip
             continue
         quote = market.quotes.get(ticker)
         mark = quote.last if quote is not None and quote.last > 0 else position.entry_price
-        sector = market.vols[ticker].sector if ticker in market.vols else None
+        vol = market.vols.get(ticker)
+        sector = (vol.sector if vol is not None and vol.sector else None) or sector_of(ticker)
         rows.append(Exposure(ticker, position.side, position.qty, mark, sector))
     return rows
 
@@ -495,7 +497,7 @@ def _plan_entries(
         sized = size_target_with_cluster(
             score=signal.score, credibility=qual.credibility, session=session, equity=equity,
             price=quote.last, atr=vol.atr, direction=qual.direction, ticker=signal.ticker,
-            sector=vol.sector, exposures=exposures, correlations=market.correlations,
+            sector=vol.sector or sector_of(signal.ticker), exposures=exposures, correlations=market.correlations,
             trades_today=trades, new_risk_today=risk_used, cfg=cfg,
         )
         if sized.qty < 1:

@@ -22,14 +22,6 @@ _SESSIONS = ("rth", "pre", "after", "overnight", "closed")
 _OPEN_SESSIONS = ("rth", "pre", "after", "overnight")
 
 
-def _parse_hms(value: str) -> time:
-    parts = value.split(":")
-    if len(parts) != 3:
-        raise ConfigError(f"expected HH:MM:SS, got {value!r}")
-    hour, minute, second = (int(part) for part in parts)
-    return time(hour, minute, second)
-
-
 @dataclass(frozen=True)
 class Config:
     mode: str
@@ -51,6 +43,9 @@ class Config:
     flip_min_score: float
     neutral_exit_score: float
     opposite_exit_score: float
+    hold_until_score: float
+    low_score_trail_pct: float
+    time_exits_enabled: bool
     conviction_k: float
     conviction_mid: float
     conviction_score_lo: float
@@ -98,8 +93,6 @@ class Config:
     max_hold_hours: float
     overnight_min_score: float
     flatten_before_close_minutes: float
-    preopen_flatten_start: time
-    preopen_flatten_end: time
     earnings_entry_blackout_before_hours: float
     earnings_entry_blackout_after_hours: float
     earnings_flatten_before_hours: float
@@ -196,8 +189,13 @@ def _validate(cfg: Config) -> None:
         "tp1_fraction",
         "tp2_fraction",
         "scale_in_first_fraction",
+        "low_score_trail_pct",
     ):
         _unit(name, getattr(cfg, name))
+    if not 0 <= cfg.hold_until_score < cfg.min_score:
+        raise ConfigError("hold_until_score must be below the entry minimum")
+    if not isinstance(cfg.time_exits_enabled, bool):
+        raise ConfigError("time_exits_enabled must be a boolean")
     if cfg.tp1_fraction + cfg.tp2_fraction >= 1:
         raise ConfigError("take-profit fractions must leave a runner")
     if not cfg.tp1_r < cfg.tp2_r:
@@ -211,8 +209,6 @@ def _validate(cfg: Config) -> None:
     for session in cfg.scale_in_sessions:
         if session not in _OPEN_SESSIONS:
             raise ConfigError(f"unknown scale-in session {session}")
-    if cfg.preopen_flatten_start >= cfg.preopen_flatten_end:
-        raise ConfigError("pre-open flatten window is inverted")
     if not cfg.order_id_prefix.isascii() or not cfg.order_id_prefix.replace("-", "").isalnum():
         raise ConfigError("order_id_prefix must be ascii alphanumeric")
     if cfg.cred_min <= 0 or cfg.cred_max > 1 or cfg.cred_min > cfg.cred_max:
@@ -229,8 +225,6 @@ def _coerce(raw: dict[str, Any]) -> dict[str, Any]:
     data["scale_in_sessions"] = tuple(data["scale_in_sessions"])
     data["institutional_source_types"] = tuple(data["institutional_source_types"])
     data["social_source_types"] = tuple(data["social_source_types"])
-    data["preopen_flatten_start"] = _parse_hms(data["preopen_flatten_start"])
-    data["preopen_flatten_end"] = _parse_hms(data["preopen_flatten_end"])
     data["poll_seconds"] = int(data["poll_seconds"])
     data["max_positions"] = int(data["max_positions"])
     data["max_trades_per_day"] = int(data["max_trades_per_day"])

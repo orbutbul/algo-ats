@@ -10,7 +10,7 @@ This task does not deploy the service and does not send an order. The default mo
 
 Every 10 minutes (configurable, 5–15):
 
-1. Read a batch of `NewsSignal`s and a market snapshot (quotes, ATR, optional confirmation, earnings/macro events). Both are injected. This package does not call Wirewatch and does not fetch quotes.
+1. Read a batch of `NewsSignal`s. Quotes and ATR come from a local file when it already has them, otherwise from Alpaca paper data and then Yahoo. Earnings and CPI/FOMC are still an injected list. This package does not call Wirewatch.
 2. Classify the ET session. Closed sessions, including Friday 20:00 through Sunday 20:00 and the night before a market holiday, take no new risk.
 3. If the kill switch, the daily-loss halt, or the drawdown breaker is on, flatten and skip every signal.
 4. Otherwise review resting orders, then exits, then new entries.
@@ -35,7 +35,7 @@ Wirewatch is not a dependency. One object is the whole contract:
 
 `parse_wirewatch_payload` is the only function that knows Wirewatch's key names (`type` or `source_type`, `id` or `signal_id`). `WirewatchPushSource.fetch` is a stub and does not open a socket. Until Wirewatch can push, point `JsonFileSignalSource` at a JSON file the scanner overwrites.
 
-Market data is the same shape: a `MarketSnapshot` the caller fills in. Confirmation, when present, is a return since the signal and a relative volume. ATR is in dollars. Sector and return-correlation are optional; when they are missing those caps do not fire (see below).
+Market data is a `MarketSnapshot`. If `--market` already has a quote and an ATR for the ticker, that file wins and nothing is fetched. Otherwise the loop asks Alpaca with the paper keys (`data.alpaca.markets` for the quote and daily bars, `paper-api.alpaca.markets` for shortable / easy-to-borrow and the session calendar) and, if that call fails, Yahoo Finance daily bars. Yahoo has no bid/ask and no locate, so the fallback prints the last trade as both sides of the quote and will not open a short. Relative volume is the latest bar divided by the mean of the bars before it. The return versus the previous close is what confirmation uses when no one passed a return in by hand.
 
 ## 1. Qualification
 
@@ -129,12 +129,12 @@ The share count is then cut by the tightest of:
 | Gross exposure | 85% of equity |
 | Net exposure | 55% of equity |
 | Open positions | 8 names, counting resting entries |
-| Sector | 30% of equity, only when a sector is supplied |
+| Sector | 30% of equity. Sector comes from the snapshot if present, otherwise from the static map in `sectors.py` |
 | Correlation cluster | 25% of equity for names with correlation ≥ 0.75, only when a correlation is supplied |
 | New risk opened today | 2.0% of equity, summed as `shares * stop_distance`, released if the entry is cancelled unfilled |
 | New entries today | 6, not counting exits or the scale-in clip |
 
-A missing sector or a missing correlation does not block the trade. Unknown names are exempt rather than dumped into one bucket, because a missing map would otherwise cap the whole book at 30%. Net at 55% is deliberate: the morning batch deploys 90% of equity in one direction, and this book will not.
+The sector map is a checked-in table of liquid US tickers to a GICS-style sector (Technology, Financials, Health Care, and the rest). It exists so two megacap tech names cannot silently become the whole book just because nobody passed a sector on the quote. A ticker that is not in the table is not capped. Correlation still needs a number from outside; a missing pair is not treated as correlated. Net at 55% is deliberate: the morning batch deploys 90% of equity in one direction, and this book will not.
 
 In regular hours and pre-market the target is split **60% / 40%**. The second clip is sent only if price moves **0.35 ATR** in favor within **45 minutes**. After-hours and overnight send the target in one clip. The second clip is dropped if the daily risk budget no longer fits.
 
@@ -180,7 +180,7 @@ sell: max(bid, min(mid * (1 - offset), ask)), then ≥ decision_mid * (1 - max_c
 | After-hours | 16:00–20:00 | true | 10 bp | 35 bp | 1.00% | 180s, one replace |
 | Closed | Weekends, holidays, Fri 20:00–Sun 20:00, holiday eves | no new orders | | | | |
 
-Early-close days are an injected map of date → regular-session end. After-hours then runs four hours, capped at 20:00. That four-hour assumption is not an exchange feed.
+Early-close days come from Alpaca's calendar when the feed is used (`close` before 16:00). After-hours then runs four hours, capped at 20:00. A file can still pass the map directly.
 
 Skip the entry, and write the reason, when:
 
@@ -208,16 +208,15 @@ Initial risk per share is the same `stop_distance` as sizing, measured from the 
 | Trail exit | bar low ≤ stop | bar high ≥ stop | Reason `trail_stop` once the stop has moved, else `stop` |
 | Scale out, qty ≥ 3 | Sell 40% at +1.5 R and 30% at +2.5 R, leave the rest | Mirror | Fractions of the shares held when the level is hit. Both levels on one bar sell both slices |
 | Small position | Full exit at +2.0 R | Mirror | Qty under 3 |
-| Alpha decay | Flat if peak favorable excursion is still under 0.4 R | Same | After **8 hours** of non-closed session time, not wall-clock. Weekends do not count |
-| Time stop | Flat | Same | **36 hours** of wall-clock time, even if the trade worked |
+| Score faded | Flat | Same | Any fresh signal on this ticker with score **< 60**. The position stays open through a neutral 75 or a same-direction 70. This replaces the old neutral-75 invalidation |
+| 2% trail | Stop = high-water mark × 0.98 | Mirror, × 1.02 | Used when the entry score is **85 or lower**, including an adopted position with no score. It is active immediately and never loosens the initial stop. A score **above 85** keeps the ATR trail instead |
 | Reversal | Flat | Same | A fresh opposite signal that itself passes the source gate and scores at least as high as the position (and at least 65) |
-| Invalidation | Flat | Same | A fresh `neutral` signal with score ≥ 75 |
 | Flip | After that exit, open the other side | Same | Only if the new score is ≥ **80** and at least **5 points** above the position. Otherwise flatten and stay flat |
-| Into the close | Flat from 15:50 ET | Same | Score under **85**, any Friday, or any evening whose overnight session will not run (weekend or the night before a holiday) |
-| Overnight hold | Allowed | Same | Score ≥ 85, and only Sun evening through Thu evening when the next regular session exists |
-| Pre-open | Flat at 09:20–09:30 if still red | Same | Only positions that were opened outside regular hours and scored under 85. A winner is allowed to convert to the regular session |
-| Earnings | Flat | Same | From **4 hours** before the print until **30 minutes** after, for that ticker |
-| Macro, score under 90 | Flat | Same | From **15 minutes** before CPI/FOMC until the print |
+| Into the close | Flat from 15:50 ET | Same | Score **85 or lower**. Also any Friday, and any evening whose overnight session will not run (weekend or the night before a holiday), regardless of score |
+| Overnight hold | Allowed | Same | Score **strictly above 85**, Sunday evening through Thursday evening, and only when that overnight session exists |
+| Time stop / alpha decay | Off | Off | `time_exits_enabled` is false. A high-score position is not closed just for being old; it waits for a score under 60, a stop, or a daily-loss halt |
+| Earnings | Flat | Same | From **4 hours** before the print until **30 minutes** after, for that ticker, when an event is supplied |
+| Macro, score under 90 | Flat | Same | From **15 minutes** before CPI/FOMC until the print, when an event is supplied |
 | Macro, score ≥ 90 | Hold, stop pulled in to 0.75 R | Mirror | Never loosened. New entries are still blocked through 15 minutes after the print |
 
 Exits are priced at the touch (sell the bid, buy the ask) even when the spread is wide. Getting flat matters more than saving the spread. Entries still refuse that spread.
@@ -229,10 +228,10 @@ Exits are priced at the touch (sell the bid, buy the ask) even when the spread i
 | Daily loss | 1.5% of the equity snapshotted at the first cycle of the ET date | Flattens and blocks new entries until the next ET date. The first cycle of a process does not trip on losses that happened before it was watching |
 | Max drawdown | 8% from the persisted equity peak | Flattens and stays halted until `LIVE_SIGNALS_RESET_DRAWDOWN=1` or the reset file is present. The reset is consumed (file deleted, env var popped) and the peak is rebased to current equity. A reset file that is already sitting there does not clear a breaker in the same cycle that trips it |
 | Kill switch | `LIVE_SIGNALS_KILL=1` or a file at `LIVE_SIGNALS_KILL` | Flattens, including adopted positions, and skips every signal. Only the exact value `1` counts. The flag stays until the operator removes it |
-| Startup reconciliation | Broker quantities win | Adopted positions are recorded and, by default, **not managed** (`manage_adopted_positions: false`). Orphan open orders whose client id starts with `ww-` are cancelled. Any other open order is left alone |
+| Startup reconciliation | Broker quantities win | Adopted positions are managed: they stay open until a fresh score is under 60, the 2% trail, or a halt. Orphan open orders whose client id starts with `ww-` are cancelled. Any other open order is left alone |
 | Account guard | `PA32ZMSEI`, account type `paper` | Checked in code, not in the config file, before any cancel, replace, or submit. `PA3V3A1X0IX6` is rejected. `log_only` and `live` cannot submit. The Alpaca adapter's only base URL is `https://paper-api.alpaca.markets` |
 
-Keys are read from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (or `ALPACA_API_SECRET`) inside `AlpacaPaperBroker.from_env`. They are scrubbed out of exception text and they are not in `__repr__`. The CLI never constructs that class.
+Keys are read from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (or `ALPACA_API_SECRET`). They are scrubbed out of exception text and they are not in `__repr__`. Log-only still does not submit orders. Omitting `--market` is the path that calls Alpaca for quotes.
 
 ## 6. Modes
 
@@ -259,6 +258,8 @@ live_signals/
   alpaca_broker.py       paper REST adapter, transport-injected
   state.py               SQLite document
   journal.py             decision CSV
+  marketdata.py          Alpaca quotes/ATR/calendar, Yahoo fallback
+  sectors.py             static ticker to sector map
   sources.py             JSON file reader and the Wirewatch stub
   notify.py              in-memory hook; no socket
 ```
@@ -268,7 +269,7 @@ Notification hooks are `emit(event, payload)` for `halt`, `take`, and `exit`. `M
 Polling entry point:
 
 ```
-python -m live_signals --signals signals.json --market market.json --once
+python -m live_signals --signals signals.json --once
 python -m live_signals --signals signals.json --market market.json
 ```
 
@@ -303,24 +304,24 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-`signals.json` is the Wirewatch drop. `market.json` is whatever quote/ATR feed is chosen later. Neither file is fetched by this package.
+`signals.json` is the Wirewatch drop. Leave `--market` off and the process loads quotes from Alpaca, then Yahoo. A market file, when present, overrides those feeds for any ticker it already contains.
 
 ## Rollout
 
 **Days 1–7, log-only.** Run the unit on the VPS. No Alpaca keys. Each morning, read the CSV: how many signals qualified, the skip reasons (especially `single_social_unconfirmed`), the share counts, and whether the same ticker is firing every poll. Compare the takes with what the 8am batch would have done. The batch keeps running on PA32ZMSEI during this week; log-only does not touch it.
 
-**Days 8–14, paper, only if the CSV looks sane.** Switch the engine to `paper` in code (the CLI will not do it) pointed at PA32ZMSEI, and turn the 8am batch off for that account on the same day. Leave `manage_adopted_positions` false so leftover morning-batch positions are recorded and not flattened. Keep the kill file path on the box and the 6-trade / 1.5% daily-loss limits. Review fills against the limits, extended-hours rejects, and short-locate skips.
+**Days 8–14, paper, only if the CSV looks sane.** Switch the engine to `paper` in code (the CLI will not do it) pointed at PA32ZMSEI, and turn the 8am batch off for that account on the same day. Positions already in the account are managed from then on: they stay open until a fresh score is under 60, unless the 2% trail, a stop, or the 1.5% daily-loss halt closes them. Keep the kill file path on the box and the 6-trade cap. Review fills against the limits, extended-hours rejects, and short-locate skips.
 
 Promotion past that is a separate decision. It is not this change.
 
-## Open questions for Or
+## Decisions from review
 
-1. Can Wirewatch overwrite a JSON file each scan, or is the dashboard the only output? The engine polls a file. The HTTP stub does not call anything.
-2. Where do quote, spread, ATR, shortable, and relative volume come from on the VPS? This package refuses to import the other ATS feed. Alpaca market data is the obvious later source and is not wired here.
-3. When paper mode is turned on, should it adopt and manage the positions the 8am routine already has in PA32ZMSEI? The default is to record them and leave them alone, except that a kill switch, a daily-loss halt, or the drawdown breaker will flatten them too.
-4. Sector labels and return correlations are optional and currently no-ops without a feed. Is a static sector map enough, or should those caps stay off until there is one?
-5. Who supplies the earnings time and the CPI/FOMC clock? The engine will not download a calendar. An empty calendar means those rules never fire.
-6. Is "hold overnight only at score ≥ 85, and always flat by Friday 15:50" the policy you want, given the overnight session runs Sunday night through Friday morning?
-7. The net cap is 55% of equity, so a one-way book deploys less than today's 90% equal split. Confirm that is the point of the change.
-8. A single Reddit post now needs 88, or 78 plus a 0.4% move and 1.5× volume. The GOOGL 70 would be skipped. Is 88 the right bar?
-9. The 8am job and this engine must not both send orders to PA32ZMSEI. Confirm the batch is switched off only after the log-only week, on a day you are watching.
+Wirewatch does not have to push. The loop re-reads a JSON file. If the scanner only has a dashboard today, the missing piece is a few lines on the VPS that write the latest signals to that file. This package will not scrape the dashboard.
+
+Quotes, ATR, borrow flags, and the NYSE session calendar come from Alpaca with the paper keys. Yahoo Finance daily bars are the fallback for price and ATR only. Alpaca's corporate-actions feed is splits, dividends, and mergers. It does not include an earnings timestamp or a CPI/FOMC clock, so those rules run only when an event list is passed in. Holidays and early closes do come from `GET /v2/calendar`.
+
+A position stays open until a fresh signal on that ticker scores under 60, or a stop, the 2% trail, the 15:50 rule, or the daily-loss halt says otherwise. Adopted positions from the morning batch are managed under those same rules. Daily loss, the kill switch, and the drawdown breaker still flatten everything.
+
+Overnight is allowed only when the entry score is above 85. At 85 or below, a 2% trail runs during the day and the position is flat from 15:50 ET. Friday 15:50 is flat for every score, because Friday night is not an overnight session.
+
+The 55% net cap and the single-source bar of 88 (or 78 with confirmation) stay. The 8am batch and this engine must not both send orders to PA32ZMSEI. The batch stays on through the log-only week and comes off only when paper mode is pointed at that account.
