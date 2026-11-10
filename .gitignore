@@ -13,6 +13,9 @@ wheels/
 data/
 .env
 
+# RS proxy artifacts (generated). Source databases are not written here.
+output/
+
 # daily_run.py logs
 logs/
 
