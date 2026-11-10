@@ -35,8 +35,6 @@ agentic/
 execution/alpaca_live.py
 
 #in progress
-machine_learning/
-
 screens/
 
 .dockerignore
