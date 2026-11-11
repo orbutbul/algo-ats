@@ -14,7 +14,7 @@ class VCPParams:
     setup. Depths are linear percent pullbacks: (peak - trough) / peak.
     """
 
-    lookback_bars: int = 60
+    lookback_bars: int = 75  # max base width (peak → final trough)
     price_space: str = 'pct'  # 'pct' (linear %) | 'log'
 
     min_contractions: int = 2
@@ -51,7 +51,7 @@ class VCPParams:
 
     require_higher_lows: bool = True
     allow_single_bar_final: bool = True
-    min_base_bars: int = 12
+    min_base_bars: int = 30
     max_bars_to_breakout: int = 20
     dedupe_pivot_tol: float = 0.005
 
