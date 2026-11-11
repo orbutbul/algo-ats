@@ -39,6 +39,16 @@ def _zigzag_pivots(
     if n == 0:
         return []
 
+    # DatetimeIndex.__getitem__ boxes a Timestamp on every hit. Pulling the
+    # numpy values once keeps the same Timestamp, including tz.
+    stamps = index.to_numpy()
+    if np.issubdtype(stamps.dtype, np.datetime64):
+        def _stamp(i: int):
+            return pd.Timestamp(stamps[i])
+    else:
+        def _stamp(i: int):
+            return index[i]
+
     pivots: list[Pivot] = []
     direction = 0
     cand_i = 0
@@ -53,7 +63,7 @@ def _zigzag_pivots(
                 cand_high = h
                 cand_i = i
             elif cand_high > 0 and (cand_high - l) / cand_high >= down_th:
-                pivots.append(Pivot(index=index[cand_i], price=float(cand_high), kind='high', bar=cand_i))
+                pivots.append(Pivot(index=_stamp(cand_i), price=float(cand_high), kind='high', bar=cand_i))
                 direction = -1
                 cand_low = l
                 cand_i = i
@@ -63,7 +73,7 @@ def _zigzag_pivots(
                 cand_low = l
                 cand_i = i
             elif cand_low > 0 and (h - cand_low) / cand_low >= up_th:
-                pivots.append(Pivot(index=index[cand_i], price=float(cand_low), kind='low', bar=cand_i))
+                pivots.append(Pivot(index=_stamp(cand_i), price=float(cand_low), kind='low', bar=cand_i))
                 direction = 1
                 cand_high = h
                 cand_i = i
