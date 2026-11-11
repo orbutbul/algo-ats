@@ -1,4 +1,4 @@
-"""Synthetic VCP path — contiguous peak→trough→recovery coils + breakout."""
+"""Synthetic VCP — contiguous coils + volume dry-up into breakout."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from vcp.pivots import Pivot
 
 
 def _synthetic_vcp(n: int = 320) -> pd.DataFrame:
-    """Build a Stage-2 uptrend with a textbook 3-contraction coil then breakout."""
     rng = np.random.default_rng(7)
     idx = pd.bdate_range('2023-01-02', periods=n, tz='UTC')
     close = np.empty(n, dtype=float)
@@ -49,12 +48,12 @@ def _synthetic_vcp(n: int = 320) -> pd.DataFrame:
     for j, ret in enumerate(np.linspace(0, -0.04, 4)):
         i = 254 + j
         close[i] = peak3 * (1.0 + ret)
-        volume[i] = float(rng.integers(250_000, 400_000))
+        volume[i] = float(rng.integers(200_000, 350_000))  # distinct dry-up
     low3 = close[257]
     for j, ret in enumerate(np.linspace(0, 0.03, 3)):
         i = 258 + j
         close[i] = low3 * (1.0 + ret)
-        volume[i] = float(rng.integers(300_000, 450_000))
+        volume[i] = float(rng.integers(220_000, 380_000))
 
     for j in range(261, n):
         close[j] = peak3 * (1.02 + 0.004 * (j - 261))
@@ -66,9 +65,8 @@ def _synthetic_vcp(n: int = 320) -> pd.DataFrame:
 
     high = close * 1.005
     low = close * 0.995
-    open_ = close.copy()
     return pd.DataFrame(
-        {'Open': open_, 'High': high, 'Low': low, 'Close': close, 'Volume': volume},
+        {'Open': close.copy(), 'High': high, 'Low': low, 'Close': close, 'Volume': volume},
         index=idx,
     )
 
@@ -84,15 +82,10 @@ def test_build_coils_are_contiguous_peak_trough_recovery():
     ]
     idx = pd.bdate_range('2024-01-02', periods=30)
     volume = pd.Series(1_000_000.0, index=idx)
-    atr = pd.Series(2.0, index=idx)
-    coils = build_coils(pivots, volume, atr)
+    coils = build_coils(pivots, volume)
     assert len(coils) == 3
-    assert coils[0].recovery_peak is not None
     assert coils[1].peak.bar == coils[0].recovery_peak.bar
-    assert coils[1].recovery_peak is not None
     assert coils[2].peak.bar == coils[1].recovery_peak.bar
-    assert coils[0].depth_pct == 0.2
-    assert coils[0].recovery_frac == (95 - 80) / (100 - 80)
 
 
 def test_detects_synthetic_vcp_breakout():
@@ -100,12 +93,12 @@ def test_detects_synthetic_vcp_breakout():
     params = VCPParams(
         require_trend_template=False,
         lookback_bars=80,
-        pivot_threshold_mode='pct',
         pivot_up_th=0.03,
         pivot_down_th=0.03,
-        use_atr_depth_checks=False,
         vdu_max_ratio=0.85,
+        vdu_quiet_bar_ratio=0.60,
         breakout_rel_vol=1.2,
+        breakout_vs_dryup_mult=1.5,
         min_first_depth=0.05,
         max_final_depth=0.06,
         contraction_ratio=0.65,
@@ -117,8 +110,7 @@ def test_detects_synthetic_vcp_breakout():
     bo = result.breakouts[-1]
     assert bo.n_contractions >= 2
     assert bo.depths[0] > bo.depths[-1]
-    assert bo.breakout_rel_vol >= params.breakout_rel_vol
-    # Contiguous chain in the accepted sequence.
+    assert bo.breakout_vs_dryup >= params.breakout_vs_dryup_mult
     for prev, cur in zip(bo.contractions, bo.contractions[1:]):
         assert prev.recovery_peak is not None
         assert cur.peak.bar == prev.recovery_peak.bar

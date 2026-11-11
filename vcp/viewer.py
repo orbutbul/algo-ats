@@ -213,7 +213,8 @@ PAGE = r'''<!DOCTYPE html>
             <th>Pivot</th>
             <th>Stop</th>
             <th>Depths %</th>
-            <th>Depth ATR</th>
+            <th>Coil vol / MA</th>
+            <th>Vs dry-up</th>
             <th>Rel vol</th>
           </tr>
         </thead>
@@ -261,14 +262,15 @@ PAGE = r'''<!DOCTYPE html>
           tableWrap.style.display = 'block';
           for (const e of data.events) {
             const tr = document.createElement('tr');
-            const atrs = (e.depth_atrs || []).map(x => Number(x).toFixed(1)).join(' → ');
+            const vdu = (e.volume_dryup_ratios || []).map(x => (Number(x) * 100).toFixed(0) + '%').join(' → ');
             tr.innerHTML = `
               <td>${e.breakout_date}</td>
               <td>${e.footprint}</td>
               <td>${e.pivot_price.toFixed(2)}</td>
               <td>${e.stop_price.toFixed(2)}</td>
               <td>${e.depths_pct.map(x => x.toFixed(1)).join(' → ')}</td>
-              <td>${atrs}</td>
+              <td>${vdu}</td>
+              <td>${Number(e.breakout_vs_dryup).toFixed(2)}×</td>
               <td>${e.breakout_rel_vol.toFixed(2)}×</td>
             `;
             tbody.appendChild(tr);

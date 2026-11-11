@@ -1,7 +1,7 @@
 """VCP structure + breakout detection on daily OHLCV.
 
-Coils are built as peak → trough → recovery → next peak (contiguous structure),
-not by deleting noise legs from a zigzag list and gluing strangers together.
+Coils are peak → trough → recovery → next peak. The entry signal is a
+*volume* dry-up into the final coil, then expansion on the pivot break.
 """
 
 from __future__ import annotations
@@ -25,17 +25,16 @@ class Coil:
     recovery_peak: Pivot | None
     depth_log: float
     depth_pct: float
-    depth_atr: float
     mean_volume: float
+    min_volume: float  # quietest bar in the pullback (dry-up tell)
     bars: int
-    recovery_frac: float  # 0..1+ of pullback reclaimed into recovery_peak
+    recovery_frac: float
 
     @property
     def depth(self) -> float:
         return self.depth_log
 
 
-# Back-compat alias used by older plot/tests naming.
 Contraction = Coil
 
 
@@ -47,9 +46,10 @@ class VCPBreakout:
     stop_price: float
     n_contractions: int
     depths: tuple[float, ...]
-    depth_atrs: tuple[float, ...]
     volume_dryup_ratios: tuple[float, ...]
+    quiet_bar_ratios: tuple[float, ...]
     breakout_rel_vol: float
+    breakout_vs_dryup: float
     footprint: str
     contractions: tuple[Coil, ...] = field(repr=False)
 
@@ -61,9 +61,10 @@ class VCPBreakout:
             'stop_price': self.stop_price,
             'n_contractions': self.n_contractions,
             'depths': list(self.depths),
-            'depth_atrs': list(self.depth_atrs),
             'volume_dryup_ratios': list(self.volume_dryup_ratios),
+            'quiet_bar_ratios': list(self.quiet_bar_ratios),
             'breakout_rel_vol': self.breakout_rel_vol,
+            'breakout_vs_dryup': self.breakout_vs_dryup,
             'footprint': self.footprint,
         }
 
@@ -74,24 +75,23 @@ class VCPResult:
     params: VCPParams
     breakouts: tuple[VCPBreakout, ...]
     pivots: tuple[Pivot, ...] = field(repr=False)
-    atr: pd.Series | None = field(default=None, repr=False)
 
     def to_frame(self) -> pd.DataFrame:
+        cols = [
+            'ticker',
+            'breakout_date',
+            'pivot_price',
+            'stop_price',
+            'n_contractions',
+            'depths',
+            'volume_dryup_ratios',
+            'quiet_bar_ratios',
+            'breakout_rel_vol',
+            'breakout_vs_dryup',
+            'footprint',
+        ]
         if not self.breakouts:
-            return pd.DataFrame(
-                columns=[
-                    'ticker',
-                    'breakout_date',
-                    'pivot_price',
-                    'stop_price',
-                    'n_contractions',
-                    'depths',
-                    'depth_atrs',
-                    'volume_dryup_ratios',
-                    'breakout_rel_vol',
-                    'footprint',
-                ]
-            )
+            return pd.DataFrame(columns=cols)
         return pd.DataFrame([b.to_dict() for b in self.breakouts])
 
 
@@ -140,21 +140,13 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=['High', 'Low', 'Close', 'Volume'])
 
 
-def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
-    atr = vbt.ATR.run(high, low, close, window=window).atr
-    return _series_1d(atr)
-
-
 def _trend_template_mask(close: pd.Series, high: pd.Series, low: pd.Series, params: VCPParams) -> pd.Series:
-    """Minervini Stage-2 style filter via vbt moving averages."""
     ma_fast = _series_1d(vbt.MA.run(close, params.ma_fast).ma)
     ma_mid = _series_1d(vbt.MA.run(close, params.ma_mid).ma)
     ma_slow = _series_1d(vbt.MA.run(close, params.ma_slow).ma)
     rising = ma_slow > ma_slow.shift(params.ma_slow_rising_bars)
     year_low = low.rolling(252, min_periods=100).min()
     year_high = high.rolling(252, min_periods=100).max()
-    above_low = close >= year_low * 1.30
-    near_high = close >= year_high * 0.75
     return (
         (close > ma_fast)
         & (close > ma_mid)
@@ -162,21 +154,13 @@ def _trend_template_mask(close: pd.Series, high: pd.Series, low: pd.Series, para
         & (ma_fast > ma_mid)
         & (ma_mid > ma_slow)
         & rising
-        & above_low
-        & near_high
+        & (close >= year_low * 1.30)
+        & (close >= year_high * 0.75)
     )
 
 
-def build_coils(
-    pivots: list[Pivot],
-    volume: pd.Series,
-    atr: pd.Series,
-) -> list[Coil]:
-    """Walk H-L-H-L… as contiguous coils: peak → trough → recovery peak.
-
-    Next coil starts at the recovery peak (shared vertex), so sequences are
-    structurally adjacent on the chart — not re-glued after noise filtering.
-    """
+def build_coils(pivots: list[Pivot], volume: pd.Series) -> list[Coil]:
+    """Walk H-L-H-L… as contiguous coils: peak → trough → recovery peak."""
     coils: list[Coil] = []
     i = 0
     while i + 1 < len(pivots):
@@ -189,54 +173,41 @@ def build_coils(
         if i + 2 < len(pivots) and pivots[i + 2].kind == 'high':
             recovery = pivots[i + 2]
 
-        depth_log = _depth_log(a.price, b.price)
-        depth_pct = _depth_pct(a.price, b.price)
-        atr_v = float(atr.iloc[b.bar]) if b.bar < len(atr) and np.isfinite(atr.iloc[b.bar]) else float('nan')
-        depth_atr = float((a.price - b.price) / atr_v) if atr_v and atr_v > 0 else float('nan')
-
         seg = volume.iloc[a.bar : b.bar + 1]
         mean_vol = float(seg.mean()) if len(seg) else float('nan')
-
+        min_vol = float(seg.min()) if len(seg) else float('nan')
         pull = a.price - b.price
-        if recovery is not None and pull > 0:
-            recovery_frac = float((recovery.price - b.price) / pull)
-        else:
-            recovery_frac = float('nan')
-
+        recovery_frac = (
+            float((recovery.price - b.price) / pull) if recovery is not None and pull > 0 else float('nan')
+        )
         coils.append(
             Coil(
                 peak=a,
                 trough=b,
                 recovery_peak=recovery,
-                depth_log=depth_log,
-                depth_pct=depth_pct,
-                depth_atr=depth_atr,
+                depth_log=_depth_log(a.price, b.price),
+                depth_pct=_depth_pct(a.price, b.price),
                 mean_volume=mean_vol,
+                min_volume=min_vol,
                 bars=max(1, b.bar - a.bar),
                 recovery_frac=recovery_frac,
             )
         )
-        # Advance to the recovery peak so the next coil shares that vertex.
-        i = i + 2 if recovery is not None else i + 2
+        i += 2
     return coils
 
 
 def _maybe_tighten_final_with_sideways(
     coils: list[Coil],
     ohlcv: pd.DataFrame,
-    atr: pd.Series,
     vol_ma: pd.Series,
     params: VCPParams,
 ) -> list[Coil]:
-    """If the last coil is still loose, allow a 1-bar/sideways micro coil after recovery."""
+    """If the last coil is still loose, allow a quiet sideways micro-coil after recovery."""
     if not params.allow_single_bar_final or not coils:
         return coils
     last = coils[-1]
-    if last.recovery_peak is None:
-        return coils
-    if np.isfinite(last.depth_atr) and last.depth_atr <= params.max_final_atr_mult:
-        return coils
-    if last.depth_pct <= params.max_final_depth:
+    if last.recovery_peak is None or last.depth_pct <= params.max_final_depth:
         return coils
 
     start = last.recovery_peak.bar
@@ -244,45 +215,61 @@ def _maybe_tighten_final_with_sideways(
     if len(window) < 2:
         return coils
     peak_price = float(window['High'].max())
-    peak_pos = int(window['High'].values.argmax())
-    peak_iloc = start + peak_pos
+    peak_iloc = start + int(window['High'].values.argmax())
     trail = ohlcv.iloc[peak_iloc : peak_iloc + 6]
     if trail.empty:
         return coils
     valley_price = float(trail['Low'].min())
-    valley_pos = int(trail['Low'].values.argmin())
-    valley_iloc = peak_iloc + valley_pos
-
-    depth_log = _depth_log(peak_price, valley_price)
+    valley_iloc = peak_iloc + int(trail['Low'].values.argmin())
     depth_pct = _depth_pct(peak_price, valley_price)
-    atr_v = float(atr.iloc[valley_iloc]) if valley_iloc < len(atr) else float('nan')
-    depth_atr = float((peak_price - valley_price) / atr_v) if atr_v and atr_v > 0 else float('nan')
+    depth_log = _depth_log(peak_price, valley_price)
     if not np.isfinite(depth_pct) or depth_pct <= 0 or depth_pct > params.max_final_depth:
-        return coils
-    if params.use_atr_depth_checks and np.isfinite(depth_atr) and depth_atr > params.max_final_atr_mult:
         return coils
     if depth_pct >= last.depth_pct:
         return coils
 
-    mean_vol = float(ohlcv['Volume'].iloc[peak_iloc : valley_iloc + 1].mean())
+    seg = ohlcv['Volume'].iloc[peak_iloc : valley_iloc + 1]
+    mean_vol = float(seg.mean())
+    min_vol = float(seg.min())
     base = vol_ma.iloc[valley_iloc] if valley_iloc < len(vol_ma) else np.nan
     if not np.isfinite(base) or base <= 0 or mean_vol / base > params.vdu_max_ratio:
         return coils
 
-    micro_peak = Pivot(index=ohlcv.index[peak_iloc], price=peak_price, kind='high', bar=peak_iloc)
-    micro_trough = Pivot(index=ohlcv.index[valley_iloc], price=valley_price, kind='low', bar=valley_iloc)
     micro = Coil(
-        peak=micro_peak,
-        trough=micro_trough,
+        peak=Pivot(index=ohlcv.index[peak_iloc], price=peak_price, kind='high', bar=peak_iloc),
+        trough=Pivot(index=ohlcv.index[valley_iloc], price=valley_price, kind='low', bar=valley_iloc),
         recovery_peak=None,
         depth_log=depth_log,
         depth_pct=depth_pct,
-        depth_atr=depth_atr,
         mean_volume=mean_vol,
+        min_volume=min_vol,
         bars=max(1, valley_iloc - peak_iloc),
         recovery_frac=float('nan'),
     )
     return coils + [micro]
+
+
+def _volume_dryup_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
+    """Distinct volume drawdown into the final coil — the low-volume entry tell."""
+    final = seq[-1]
+    base = vol_ma.iloc[final.trough.bar] if final.trough.bar < len(vol_ma) else np.nan
+    if not np.isfinite(base) or base <= 0:
+        return False
+    if not np.isfinite(final.mean_volume) or final.mean_volume / base > params.vdu_max_ratio:
+        return False
+    # At least one very quiet bar in the final coil (the visual dry-up).
+    if not np.isfinite(final.min_volume) or final.min_volume / base > params.vdu_quiet_bar_ratio:
+        return False
+    # Progressive dry-up: later coils should not be louder than earlier ones.
+    for prev, cur in zip(seq, seq[1:]):
+        if (
+            np.isfinite(prev.mean_volume)
+            and np.isfinite(cur.mean_volume)
+            and prev.mean_volume > 0
+            and cur.mean_volume > prev.mean_volume * params.volume_rise_tol
+        ):
+            return False
+    return True
 
 
 def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
@@ -291,8 +278,6 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
     if any(not np.isfinite(c.depth_log) or c.depth_log <= 0 for c in seq):
         return False
 
-    # Contiguity: each coil's peak must be the previous coil's recovery peak.
-    # Exception: an optional sideways micro-coil may start at/after that recovery.
     for i, (prev, cur) in enumerate(zip(seq, seq[1:])):
         if prev.recovery_peak is None:
             return False
@@ -302,61 +287,36 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
         micro_final = i == len(seq) - 2 and cur.peak.bar >= prev.recovery_peak.bar
         if not (shared or micro_final):
             return False
-        # Constructive recovery into the next peak (visual "base" behavior).
         if shared and np.isfinite(prev.recovery_frac) and prev.recovery_frac < params.min_recovery_frac:
             return False
 
     min_first_log = float(np.log(1.0 / (1.0 - params.min_first_depth)))
     if seq[0].depth_log < min_first_log:
         return False
-    if params.use_atr_depth_checks and np.isfinite(seq[0].depth_atr):
-        if seq[0].depth_atr < params.min_first_atr_mult:
-            return False
 
     for prev, cur in zip(seq, seq[1:]):
         if cur.depth_log > prev.depth_log * params.contraction_ratio:
             return False
-        if (
-            params.use_atr_depth_checks
-            and np.isfinite(prev.depth_atr)
-            and np.isfinite(cur.depth_atr)
-            and cur.depth_atr > prev.depth_atr * params.atr_contraction_ratio
-        ):
-            return False
         if params.require_higher_lows and cur.trough.price < prev.trough.price:
-            return False
-        if (
-            np.isfinite(prev.mean_volume)
-            and np.isfinite(cur.mean_volume)
-            and prev.mean_volume > 0
-            and cur.mean_volume > prev.mean_volume * params.volume_rise_tol
-        ):
             return False
 
     final = seq[-1]
     if final.depth_pct > params.max_final_depth:
         return False
-    if params.use_atr_depth_checks and np.isfinite(final.depth_atr):
-        if final.depth_atr > params.max_final_atr_mult:
-            return False
     if not params.allow_single_bar_final and final.bars < 2:
         return False
 
-    base = vol_ma.iloc[final.trough.bar] if final.trough.bar < len(vol_ma) else np.nan
-    if not np.isfinite(base) or base <= 0 or not np.isfinite(final.mean_volume):
-        return False
-    if final.mean_volume / base > params.vdu_max_ratio:
-        return False
-    return True
+    return _volume_dryup_ok(seq, vol_ma, params)
 
 
-def _footprint(seq: list[Coil]) -> str:
+def _footprint(seq: list[Coil], vol_ma: pd.Series) -> str:
     first_pct = _depth_to_pct_label(seq[0].depth_log)
     last_pct = _depth_to_pct_label(seq[-1].depth_log)
     weeks = max(1, round((seq[-1].trough.bar - seq[0].peak.bar) / 5))
-    last_atr = seq[-1].depth_atr
-    atr_bit = f' {last_atr:.1f}A' if np.isfinite(last_atr) else ''
-    return f'{weeks}W {first_pct:.0f}/{last_pct:.1f} {len(seq)}T{atr_bit}'
+    base = vol_ma.iloc[seq[-1].trough.bar]
+    vdu = seq[-1].mean_volume / base if np.isfinite(base) and base > 0 else float('nan')
+    vdu_bit = f' V{vdu:.0%}' if np.isfinite(vdu) else ''
+    return f'{weeks}W {first_pct:.0f}/{last_pct:.1f} {len(seq)}T{vdu_bit}'
 
 
 def _find_breakout(
@@ -365,9 +325,10 @@ def _find_breakout(
     vol_ma: pd.Series,
     trend_ok: pd.Series,
     params: VCPParams,
-) -> tuple[pd.Timestamp, float] | None:
-    # Pivot = high of the final coil (right-side resistance).
+) -> tuple[pd.Timestamp, float, float] | None:
+    """Breakout = close above final-coil peak with volume expansion vs dry-up."""
     pivot_price = seq[-1].peak.price
+    dryup_mean = seq[-1].mean_volume
     start = seq[-1].trough.bar + 1
     end = min(len(ohlcv), start + params.max_bars_to_breakout)
     for i in range(start, end):
@@ -376,14 +337,17 @@ def _find_breakout(
         base = float(vol_ma.iloc[i]) if np.isfinite(vol_ma.iloc[i]) else np.nan
         if close <= pivot_price:
             continue
-        if not np.isfinite(base) or base <= 0:
+        if not np.isfinite(base) or base <= 0 or not np.isfinite(dryup_mean) or dryup_mean <= 0:
             continue
         rel = vol / base
+        vs_dryup = vol / dryup_mean
         if rel < params.breakout_rel_vol:
+            continue
+        if vs_dryup < params.breakout_vs_dryup_mult:
             continue
         if params.require_trend_template and not bool(trend_ok.iloc[i]):
             continue
-        return ohlcv.index[i], rel
+        return ohlcv.index[i], rel, vs_dryup
     return None
 
 
@@ -392,22 +356,13 @@ def detect_vcp_breakouts(
     ticker: str = '',
     params: VCPParams | None = None,
 ) -> VCPResult:
-    """Scan daily OHLCV for contiguous VCP coil sequences and breakouts."""
+    """Scan daily OHLCV for contiguous VCP coils with volume dry-up breakouts."""
     params = params or VCPParams()
     df = _normalize_ohlcv(ohlcv)
     if len(df) < max(params.lookback_bars, params.ma_slow + params.ma_slow_rising_bars):
-        return VCPResult(ticker=ticker, params=params, breakouts=(), pivots=(), atr=None)
+        return VCPResult(ticker=ticker, params=params, breakouts=(), pivots=())
 
-    atr = compute_atr(df['High'], df['Low'], df['Close'], params.atr_window)
-    pivots = detect_pivots(
-        df['High'],
-        df['Low'],
-        up_th=params.pivot_up_th,
-        down_th=params.pivot_down_th,
-        atr=atr,
-        atr_mult=params.pivot_atr_mult,
-        threshold_mode=params.pivot_threshold_mode,
-    )
+    pivots = detect_pivots(df['High'], df['Low'], params.pivot_up_th, params.pivot_down_th)
     vol_ma = df['Volume'].rolling(params.volume_ma_window, min_periods=max(5, params.volume_ma_window // 5)).mean()
     trend_ok = (
         _trend_template_mask(df['Close'], df['High'], df['Low'], params)
@@ -415,21 +370,19 @@ def detect_vcp_breakouts(
         else pd.Series(True, index=df.index)
     )
 
-    coils = build_coils(pivots, df['Volume'], atr)
+    coils = build_coils(pivots, df['Volume'])
     breakouts: list[VCPBreakout] = []
     used_pivot_bars: set[int] = set()
 
     for end in range(params.min_contractions, len(coils) + 1):
         for n in range(params.min_contractions, min(params.max_contractions, end) + 1):
             seq = list(coils[end - n : end])
-            # Only mark a VCP when every coil but the last has a recovery vertex
-            # (the chain is structurally complete into the final trough).
             if any(c.recovery_peak is None for c in seq[:-1]):
                 continue
             span = seq[-1].trough.bar - seq[0].peak.bar
             if span > params.lookback_bars or span < params.min_base_bars:
                 continue
-            seq = _maybe_tighten_final_with_sideways(seq, df, atr, vol_ma, params)
+            seq = _maybe_tighten_final_with_sideways(seq, df, vol_ma, params)
             if len(seq) > params.max_contractions:
                 continue
             span = seq[-1].trough.bar - seq[0].peak.bar
@@ -448,11 +401,16 @@ def detect_vcp_breakouts(
             found = _find_breakout(df, seq, vol_ma, trend_ok, params)
             if found is None:
                 continue
-            bdate, rel = found
-            vdu = []
+            bdate, rel, vs_dryup = found
+            vdu, quiet = [], []
             for c in seq:
                 base = vol_ma.iloc[c.trough.bar]
-                vdu.append(float(c.mean_volume / base) if np.isfinite(base) and base > 0 else float('nan'))
+                if np.isfinite(base) and base > 0:
+                    vdu.append(float(c.mean_volume / base))
+                    quiet.append(float(c.min_volume / base))
+                else:
+                    vdu.append(float('nan'))
+                    quiet.append(float('nan'))
             breakouts.append(
                 VCPBreakout(
                     ticker=ticker,
@@ -461,20 +419,15 @@ def detect_vcp_breakouts(
                     stop_price=float(seq[-1].trough.price),
                     n_contractions=len(seq),
                     depths=tuple(float(c.depth_log) for c in seq),
-                    depth_atrs=tuple(float(c.depth_atr) for c in seq),
                     volume_dryup_ratios=tuple(vdu),
+                    quiet_bar_ratios=tuple(quiet),
                     breakout_rel_vol=float(rel),
-                    footprint=_footprint(seq),
+                    breakout_vs_dryup=float(vs_dryup),
+                    footprint=_footprint(seq, vol_ma),
                     contractions=tuple(seq),
                 )
             )
             used_pivot_bars.add(pivot_bar)
 
     breakouts.sort(key=lambda b: b.breakout_date)
-    return VCPResult(
-        ticker=ticker,
-        params=params,
-        breakouts=tuple(breakouts),
-        pivots=tuple(pivots),
-        atr=atr,
-    )
+    return VCPResult(ticker=ticker, params=params, breakouts=tuple(breakouts), pivots=tuple(pivots))

@@ -32,12 +32,11 @@ def build_vcp_figure(
     df.index = _naive_index(pd.to_datetime(df.index))
 
     fig = make_subplots(
-        rows=3,
+        rows=2,
         cols=1,
         shared_xaxes=True,
-        # Price + volume flush; ATR as a thin visual volatility strip under them.
         vertical_spacing=0.0,
-        row_heights=[0.68, 0.18, 0.14],
+        row_heights=[0.78, 0.22],
     )
 
     fig.add_trace(
@@ -46,7 +45,7 @@ def build_vcp_figure(
             y=df['Close'],
             mode='lines',
             name='Close',
-            line=dict(color='#1b2a4a', width=1.35),
+            line=dict(color='#1b2a44', width=1.35),
             hovertemplate='%{x|%Y-%m-%d}<br>Close=%{y:.2f}<extra></extra>',
         ),
         row=1,
@@ -63,6 +62,13 @@ def build_vcp_figure(
         '#c2410c',
         '#334155',
     ]
+
+    # Mark final-coil dry-up bars (quiet volume into the pivot).
+    dryup_days: set[pd.Timestamp] = set()
+    for bo in result.breakouts:
+        final = bo.contractions[-1]
+        for ts in df.index[final.peak.bar : final.trough.bar + 1]:
+            dryup_days.add(_naive_ts(ts).normalize())
 
     for i, bo in enumerate(result.breakouts):
         color = palette[i % len(palette)]
@@ -82,10 +88,7 @@ def build_vcp_figure(
                 name=bo.footprint,
                 line=dict(color=color, width=2),
                 marker=dict(size=6, color=color),
-                hovertemplate=(
-                    f'{bo.footprint}<br>%{{x|%Y-%m-%d}} %{{y:.2f}}'
-                    f'<extra></extra>'
-                ),
+                hovertemplate=f'{bo.footprint}<br>%{{x|%Y-%m-%d}} %{{y:.2f}}<extra></extra>',
                 legendgroup=f'bo{i}',
             ),
             row=1,
@@ -93,7 +96,6 @@ def build_vcp_figure(
         )
         bdate = _naive_ts(bo.breakout_date)
         depths_pct = [round((math.exp(d) - 1) * 100, 1) for d in bo.depths]
-        atrs = [round(a, 2) for a in bo.depth_atrs]
         fig.add_trace(
             go.Scatter(
                 x=[bdate],
@@ -114,7 +116,8 @@ def build_vcp_figure(
                     f'pivot=%{{y:.2f}}<br>'
                     f'stop={bo.stop_price:.2f}<br>'
                     f'depths%={depths_pct}<br>'
-                    f'depth ATR={atrs}<br>'
+                    f'coil vol vs MA={[round(v, 2) for v in bo.volume_dryup_ratios]}<br>'
+                    f'breakout vs dry-up={bo.breakout_vs_dryup:.2f}x<br>'
                     f'rel vol={bo.breakout_rel_vol:.2f}'
                     f'<extra></extra>'
                 ),
@@ -132,10 +135,16 @@ def build_vcp_figure(
             col=1,
         )
 
-    vol_colors = []
     breakout_days = {_naive_ts(b.breakout_date).normalize() for b in result.breakouts}
-    for ts, vol in zip(df.index, df['Volume'], strict=True):
-        vol_colors.append('#c2410c' if pd.Timestamp(ts).normalize() in breakout_days else '#9aa3af')
+    vol_colors = []
+    for ts in df.index:
+        day = pd.Timestamp(ts).normalize()
+        if day in breakout_days:
+            vol_colors.append('#c2410c')  # expansion
+        elif day in dryup_days:
+            vol_colors.append('#0f6a4f')  # dry-up into pivot
+        else:
+            vol_colors.append('#9aa3af')
 
     fig.add_trace(
         go.Bar(
@@ -149,34 +158,17 @@ def build_vcp_figure(
         col=1,
     )
 
-    if result.atr is not None and len(result.atr):
-        atr = result.atr.reindex(df.index)
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=atr,
-                mode='lines',
-                name='ATR',
-                line=dict(color='#0f6a4f', width=1.2),
-                hovertemplate='%{x|%Y-%m-%d}<br>ATR=%{y:.2f}<extra></extra>',
-            ),
-            row=3,
-            col=1,
-        )
-
     fig.update_yaxes(type='log', title_text='Price (log)', row=1, col=1, showgrid=True, zeroline=False)
     fig.update_yaxes(title_text='Vol', row=2, col=1, showgrid=False, zeroline=False, nticks=3)
-    fig.update_yaxes(title_text='ATR', row=3, col=1, showgrid=False, zeroline=False, nticks=3)
     fig.update_xaxes(title_text=None, showticklabels=False, row=1, col=1)
-    fig.update_xaxes(title_text=None, showticklabels=False, row=2, col=1)
-    fig.update_xaxes(title_text=None, showticklabels=True, row=3, col=1)
+    fig.update_xaxes(title_text=None, showticklabels=True, row=2, col=1)
     fig.update_layout(
         title=dict(
             text=title or f'{result.ticker} · {len(result.breakouts)} VCP breakout(s)',
             font=dict(size=20, family='Fraunces, Georgia, serif', color='#1b2a4a'),
         ),
         template='plotly_white',
-        height=820,
+        height=760,
         margin=dict(l=56, r=24, t=64, b=36),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
         paper_bgcolor='#f3efe6',

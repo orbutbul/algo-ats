@@ -20,22 +20,22 @@ python -m vcp view --port 8765
 # → http://127.0.0.1:8765
 ```
 
-Uses `vectorbtpro` when installed; otherwise open-source `vectorbt` for MAs/ATR
+Uses `vectorbtpro` when installed; otherwise open-source `vectorbt` for MAs
 (and a directional-change zigzag in place of PRO’s `PIVOTINFO`).
 
-## Coil + ATR model
+## Coil + volume dry-up model
 
-Contractions are contiguous **peak → trough → recovery → next peak** coils
-(shared vertices). ATR drives swing significance and tightness checks, and is
-plotted under volume in the viewer.
+Contractions are contiguous **peak → trough → recovery → next peak** coils.
+The entry is a **low-volume** final coil (dry-up vs the 50d volume MA, plus a
+quiet bar), then a breakout that expands vs that dry-up — not an ATR setup.
 
 ## Layout
 
-- `params.py` — ideal-path knobs (log depths, ATR, half-rule, VDU, breakout vol)
-- `pivots.py` — swing highs/lows (pct or ATR thresholds)
-- `detector.py` — coil builder + VCP sequence + breakout scan
+- `params.py` — ideal-path knobs (log depths, half-rule, volume dry-up, breakout)
+- `pivots.py` — swing highs/lows
+- `detector.py` — coil builder + VCP sequence + volume-confirmed breakout
 - `io.py` — read/seed DuckDB
 - `plot.py` — static matplotlib log chart
-- `plotly_chart.py` — interactive Plotly chart (price / volume / ATR)
+- `plotly_chart.py` — interactive Plotly chart (price + volume; dry-up bars tinted)
 - `viewer.py` — local Flask web UI
 - `cli.py` — `seed` / `chart` / `scan` / `view`
