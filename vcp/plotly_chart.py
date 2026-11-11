@@ -1,4 +1,4 @@
-"""Interactive Plotly figure: linear price + volume with VCP breakout marks."""
+"""Interactive Plotly figure: OHLC candles + volume with VCP breakout marks."""
 
 from __future__ import annotations
 
@@ -37,14 +37,36 @@ def build_vcp_figure(
         row_heights=[0.78, 0.22],
     )
 
+    if 'HLC3' not in df.columns:
+        df['HLC3'] = (df['High'] + df['Low'] + df['Close']) / 3.0
+
+    # Daily OHLC bars (open tick left, close tick right) — Minervini chart style.
+    fig.add_trace(
+        go.Ohlc(
+            x=df.index,
+            open=df['Open'],
+            high=df['High'],
+            low=df['Low'],
+            close=df['Close'],
+            name='OHLC',
+            increasing_line_color='#1d4ed8',
+            decreasing_line_color='#be185d',
+            line=dict(width=1.15),
+            hoverinfo='x+y',
+        ),
+        row=1,
+        col=1,
+    )
+    # Detection series overlaid so coil marks line up with what the detector sees.
     fig.add_trace(
         go.Scatter(
             x=df.index,
-            y=df['Close'],
+            y=df['HLC3'],
             mode='lines',
-            name='Close',
-            line=dict(color='#1b2a44', width=1.35),
-            hovertemplate='%{x|%Y-%m-%d}<br>Close=%{y:.2f}<extra></extra>',
+            name='HLC3',
+            line=dict(color='#1b2a44', width=1.2),
+            opacity=0.55,
+            hovertemplate='%{x|%Y-%m-%d}<br>HLC3=%{y:.2f}<extra></extra>',
         ),
         row=1,
         col=1,
@@ -93,7 +115,12 @@ def build_vcp_figure(
             col=1,
         )
         bdate = _naive_ts(bo.breakout_date)
-        depths_pct = [round(d * 100.0, 1) for d in bo.depths]
+        if result.params.price_space == 'log':
+            import math
+
+            depths_pct = [round((math.exp(d) - 1.0) * 100.0, 1) for d in bo.depths]
+        else:
+            depths_pct = [round(d * 100.0, 1) for d in bo.depths]
         fig.add_trace(
             go.Scatter(
                 x=[bdate],
@@ -156,9 +183,22 @@ def build_vcp_figure(
         col=1,
     )
 
-    fig.update_yaxes(title_text='Price', row=1, col=1, showgrid=True, zeroline=False)
+    fig.update_yaxes(
+        type='log' if result.params.price_space == 'log' else 'linear',
+        title_text='Price (log)' if result.params.price_space == 'log' else 'Price',
+        row=1,
+        col=1,
+        showgrid=True,
+        zeroline=False,
+    )
     fig.update_yaxes(title_text='Vol', row=2, col=1, showgrid=False, zeroline=False, nticks=3)
-    fig.update_xaxes(title_text=None, showticklabels=False, row=1, col=1)
+    fig.update_xaxes(
+        title_text=None,
+        showticklabels=False,
+        rangeslider=dict(visible=False),
+        row=1,
+        col=1,
+    )
     fig.update_xaxes(title_text=None, showticklabels=True, row=2, col=1)
     fig.update_layout(
         title=dict(
@@ -174,5 +214,6 @@ def build_vcp_figure(
         font=dict(family='IBM Plex Sans, Helvetica, sans-serif', color='#243044'),
         hovermode='x unified',
         bargap=0.05,
+        xaxis_rangeslider_visible=False,
     )
     return fig

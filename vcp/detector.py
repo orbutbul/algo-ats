@@ -35,7 +35,7 @@ class Coil:
 
     @property
     def depth(self) -> float:
-        return self.depth_pct
+        return self.depth_log
 
 
 Contraction = Coil
@@ -134,7 +134,15 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     )
     out = out.sort_index()
     out = out[~out.index.duplicated(keep='last')]
-    return out.dropna(subset=['High', 'Low', 'Close', 'Volume'])
+    out = out.dropna(subset=['High', 'Low', 'Close', 'Volume'])
+    out['HLC3'] = (out['High'] + out['Low'] + out['Close']) / 3.0
+    return out
+
+
+def _price_series(df: pd.DataFrame, source: str) -> pd.Series:
+    if source == 'close':
+        return df['Close']
+    return df['HLC3']
 
 
 def _trend_template_mask(close: pd.Series, high: pd.Series, low: pd.Series, params: VCPParams) -> pd.Series:
@@ -204,7 +212,12 @@ def _maybe_tighten_final_with_sideways(
     if not params.allow_single_bar_final or not coils:
         return coils
     last = coils[-1]
-    if last.recovery_peak is None or last.depth_pct <= params.max_final_depth:
+    max_final = (
+        float(np.log(1.0 / (1.0 - params.max_final_depth)))
+        if params.price_space == 'log'
+        else params.max_final_depth
+    )
+    if last.recovery_peak is None or last.depth_for(params.price_space) <= max_final:
         return coils
 
     start = last.recovery_peak.bar
@@ -220,9 +233,10 @@ def _maybe_tighten_final_with_sideways(
     valley_iloc = peak_iloc + int(trail['Low'].values.argmin())
     depth_pct = _depth_pct(peak_price, valley_price)
     depth_log = _depth_log(peak_price, valley_price)
-    if not np.isfinite(depth_pct) or depth_pct <= 0 or depth_pct > params.max_final_depth:
+    depth_use = depth_log if params.price_space == 'log' else depth_pct
+    if not np.isfinite(depth_use) or depth_use <= 0 or depth_use > max_final:
         return coils
-    if depth_pct >= last.depth_pct:
+    if depth_use >= last.depth_for(params.price_space):
         return coils
 
     seg = ohlcv['Volume'].iloc[peak_iloc : valley_iloc + 1]
@@ -287,7 +301,17 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
         if shared and np.isfinite(prev.recovery_frac) and prev.recovery_frac < params.min_recovery_frac:
             return False
 
-    if seq[0].depth_for(params.price_space) < params.min_first_depth:
+    min_first = (
+        float(np.log(1.0 / (1.0 - params.min_first_depth)))
+        if params.price_space == 'log'
+        else params.min_first_depth
+    )
+    max_final = (
+        float(np.log(1.0 / (1.0 - params.max_final_depth)))
+        if params.price_space == 'log'
+        else params.max_final_depth
+    )
+    if seq[0].depth_for(params.price_space) < min_first:
         return False
 
     for prev, cur in zip(seq, seq[1:]):
@@ -297,7 +321,7 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
             return False
 
     final = seq[-1]
-    if final.depth_for(params.price_space) > params.max_final_depth:
+    if final.depth_for(params.price_space) > max_final:
         return False
     if not params.allow_single_bar_final and final.bars < 2:
         return False
@@ -305,9 +329,16 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
     return _volume_dryup_ok(seq, vol_ma, params)
 
 
-def _footprint(seq: list[Coil], vol_ma: pd.Series) -> str:
-    first_pct = seq[0].depth_pct * 100.0
-    last_pct = seq[-1].depth_pct * 100.0
+def _depth_label_pct(coil: Coil, space: str) -> float:
+    """Footprint label always in familiar percent terms."""
+    if space == 'log':
+        return float((np.exp(coil.depth_log) - 1.0) * 100.0)
+    return float(coil.depth_pct * 100.0)
+
+
+def _footprint(seq: list[Coil], vol_ma: pd.Series, space: str = 'log') -> str:
+    first_pct = _depth_label_pct(seq[0], space)
+    last_pct = _depth_label_pct(seq[-1], space)
     weeks = max(1, round((seq[-1].trough.bar - seq[0].peak.bar) / 5))
     base = vol_ma.iloc[seq[-1].trough.bar]
     vdu = seq[-1].mean_volume / base if np.isfinite(base) and base > 0 else float('nan')
@@ -358,7 +389,9 @@ def detect_vcp_breakouts(
     if len(df) < max(params.lookback_bars, params.ma_slow + params.ma_slow_rising_bars):
         return VCPResult(ticker=ticker, params=params, breakouts=(), pivots=())
 
-    pivots = detect_pivots(df['High'], df['Low'], params.pivot_up_th, params.pivot_down_th)
+    # Swings + depths on HLC3 (or Close); breakout still requires Close through pivot.
+    px = _price_series(df, params.price_source)
+    pivots = detect_pivots(px, px, params.pivot_up_th, params.pivot_down_th)
     vol_ma = df['Volume'].rolling(params.volume_ma_window, min_periods=max(5, params.volume_ma_window // 5)).mean()
     trend_ok = (
         _trend_template_mask(df['Close'], df['High'], df['Low'], params)
@@ -419,7 +452,7 @@ def detect_vcp_breakouts(
                     quiet_bar_ratios=tuple(quiet),
                     breakout_rel_vol=float(rel),
                     breakout_vs_dryup=float(vs_dryup),
-                    footprint=_footprint(seq, vol_ma),
+                    footprint=_footprint(seq, vol_ma, params.price_space),
                     contractions=tuple(seq),
                 )
             )

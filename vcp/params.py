@@ -11,13 +11,15 @@ class VCPParams:
 
     Coils are peak → trough → recovery → next peak. The entry is a *low-volume*
     coil into the pivot, then a volume expansion on the breakout — not an ATR
-    setup. Depths are linear percent pullbacks: (peak - trough) / peak.
+    setup. Depths default to log(HLC3) space; set price_space='pct' for linear %.
+    Swings and coil depths use HLC3 = (High+Low+Close)/3, not Close alone.
     """
 
-    lookback_bars: int = 75  # max base width (peak → final trough)
-    price_space: str = 'pct'  # 'pct' (linear %) | 'log'
+    lookback_bars: int = 150  # max base width (peak → final trough); ~30 weeks
+    price_space: str = 'log'  # 'log' | 'pct' (linear %)
+    price_source: str = 'hlc3'  # 'hlc3' | 'close'
 
-    min_contractions: int = 2
+    min_contractions: int = 3
     max_contractions: int = 6
     # Each contraction depth must be <= prior_depth * contraction_ratio.
     contraction_ratio: float = 0.80
@@ -28,20 +30,21 @@ class VCPParams:
     pivot_up_th: float = 0.035
     pivot_down_th: float = 0.035
 
-    # Non-final coils should reclaim at least this fraction of the pullback.
-    min_recovery_frac: float = 0.35
+    # Non-final coils must reclaim most of the pullback (back near the prior peak).
+    min_recovery_frac: float = 0.80
 
     # --- Volume dry-up (the actual "low vol" entry) ---
     volume_ma_window: int = 50
-    # Final-coil average volume vs 50d MA — hard dry-up.
-    vdu_max_ratio: float = 0.65
-    # Soft: pullback volume should not rise much coil-to-coil.
-    volume_rise_tol: float = 1.15
-    # Right before breakout: require at least one very quiet bar in the final coil.
-    vdu_quiet_bar_ratio: float = 0.45  # min bar in final coil <= 45% of vol MA
+    # Final-coil average volume vs 50d MA — hard dry-up into the pivot.
+    vdu_max_ratio: float = 0.70
+    # Coil-to-coil pullback volume may rise on shakeouts; only lightly capped.
+    # The real tell is final-coil dry-up, not monotonic volume decline.
+    volume_rise_tol: float = 2.5
+    # Right before breakout: at least one quiet bar in the final coil.
+    vdu_quiet_bar_ratio: float = 0.55  # min bar in final coil <= 55% of vol MA
     # Breakout must expand vs the final-coil dry-up mean (not only vs 50d MA).
-    breakout_vs_dryup_mult: float = 1.8
-    breakout_rel_vol: float = 1.4  # also vs 50d MA
+    breakout_vs_dryup_mult: float = 1.6
+    breakout_rel_vol: float = 1.3  # also vs 50d MA
 
     require_trend_template: bool = True
     ma_fast: int = 50

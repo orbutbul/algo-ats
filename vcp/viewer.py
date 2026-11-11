@@ -347,8 +347,13 @@ def create_app(duckdb_path: Path | None = None) -> Flask:
         events = []
         for b in result.breakouts:
             d = b.to_dict()
-            # depths are linear fractions (peak-trough)/peak when price_space='pct'
-            d['depths_pct'] = [round(x * 100.0, 2) for x in b.depths]
+            # Convert stored depths (log or pct fraction) to percent labels for the table.
+            if result.params.price_space == 'log':
+                import math
+
+                d['depths_pct'] = [round((math.exp(x) - 1.0) * 100.0, 2) for x in b.depths]
+            else:
+                d['depths_pct'] = [round(x * 100.0, 2) for x in b.depths]
             events.append(d)
         payload = {
             'ticker': ticker,

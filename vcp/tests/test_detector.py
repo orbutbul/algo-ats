@@ -93,6 +93,8 @@ def test_detects_synthetic_vcp_breakout():
     params = VCPParams(
         require_trend_template=False,
         lookback_bars=80,
+        price_space='log',
+        min_contractions=3,
         pivot_up_th=0.03,
         pivot_down_th=0.03,
         vdu_max_ratio=0.85,
