@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument('--period', default='max')
     seed.set_defaults(func=cmd_seed)
 
-    chart = sub.add_parser('chart', help='Detect VCP breakouts and write a log-scale chart')
+    chart = sub.add_parser('chart', help='Detect VCP breakouts and write a price/volume chart')
     chart.add_argument('ticker')
     chart.add_argument('--start', default=None)
     chart.add_argument('--end', default=None)

@@ -1,8 +1,6 @@
-"""Interactive Plotly figure: log price + volume with VCP breakout marks."""
+"""Interactive Plotly figure: linear price + volume with VCP breakout marks."""
 
 from __future__ import annotations
-
-import math
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -95,7 +93,7 @@ def build_vcp_figure(
             col=1,
         )
         bdate = _naive_ts(bo.breakout_date)
-        depths_pct = [round((math.exp(d) - 1) * 100, 1) for d in bo.depths]
+        depths_pct = [round(d * 100.0, 1) for d in bo.depths]
         fig.add_trace(
             go.Scatter(
                 x=[bdate],
@@ -158,7 +156,7 @@ def build_vcp_figure(
         col=1,
     )
 
-    fig.update_yaxes(type='log', title_text='Price (log)', row=1, col=1, showgrid=True, zeroline=False)
+    fig.update_yaxes(title_text='Price', row=1, col=1, showgrid=True, zeroline=False)
     fig.update_yaxes(title_text='Vol', row=2, col=1, showgrid=False, zeroline=False, nticks=3)
     fig.update_xaxes(title_text=None, showticklabels=False, row=1, col=1)
     fig.update_xaxes(title_text=None, showticklabels=True, row=2, col=1)

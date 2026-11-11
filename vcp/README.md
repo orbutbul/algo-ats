@@ -31,7 +31,7 @@ quiet bar), then a breakout that expands vs that dry-up — not an ATR setup.
 
 ## Layout
 
-- `params.py` — ideal-path knobs (log depths, half-rule, volume dry-up, breakout)
+- `params.py` — ideal-path knobs (linear % depths, half-rule, volume dry-up, breakout)
 - `pivots.py` — swing highs/lows
 - `detector.py` — coil builder + VCP sequence + volume-confirmed breakout
 - `io.py` — read/seed DuckDB

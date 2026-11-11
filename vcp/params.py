@@ -11,11 +11,11 @@ class VCPParams:
 
     Coils are peak → trough → recovery → next peak. The entry is a *low-volume*
     coil into the pivot, then a volume expansion on the breakout — not an ATR
-    setup. Depths are in log-price space so % pullbacks compare across levels.
+    setup. Depths are linear percent pullbacks: (peak - trough) / peak.
     """
 
     lookback_bars: int = 60
-    price_space: str = 'log'  # 'log' | 'pct'
+    price_space: str = 'pct'  # 'pct' (linear %) | 'log'
 
     min_contractions: int = 2
     max_contractions: int = 6

@@ -24,15 +24,18 @@ class Coil:
     trough: Pivot
     recovery_peak: Pivot | None
     depth_log: float
-    depth_pct: float
+    depth_pct: float  # linear: (peak - trough) / peak
     mean_volume: float
     min_volume: float  # quietest bar in the pullback (dry-up tell)
     bars: int
     recovery_frac: float
 
+    def depth_for(self, space: str) -> float:
+        return self.depth_log if space == 'log' else self.depth_pct
+
     @property
     def depth(self) -> float:
-        return self.depth_log
+        return self.depth_pct
 
 
 Contraction = Coil
@@ -111,12 +114,6 @@ def _depth_pct(peak: float, valley: float) -> float:
     if peak <= 0 or valley <= 0 or valley > peak:
         return float('nan')
     return float((peak - valley) / peak)
-
-
-def _depth_to_pct_label(depth_log: float) -> float:
-    if not np.isfinite(depth_log):
-        return float('nan')
-    return float((np.exp(depth_log) - 1.0) * 100.0)
 
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -275,7 +272,7 @@ def _volume_dryup_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> b
 def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
     if not (params.min_contractions <= len(seq) <= params.max_contractions):
         return False
-    if any(not np.isfinite(c.depth_log) or c.depth_log <= 0 for c in seq):
+    if any(not np.isfinite(c.depth_for(params.price_space)) or c.depth_for(params.price_space) <= 0 for c in seq):
         return False
 
     for i, (prev, cur) in enumerate(zip(seq, seq[1:])):
@@ -290,18 +287,17 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
         if shared and np.isfinite(prev.recovery_frac) and prev.recovery_frac < params.min_recovery_frac:
             return False
 
-    min_first_log = float(np.log(1.0 / (1.0 - params.min_first_depth)))
-    if seq[0].depth_log < min_first_log:
+    if seq[0].depth_for(params.price_space) < params.min_first_depth:
         return False
 
     for prev, cur in zip(seq, seq[1:]):
-        if cur.depth_log > prev.depth_log * params.contraction_ratio:
+        if cur.depth_for(params.price_space) > prev.depth_for(params.price_space) * params.contraction_ratio:
             return False
         if params.require_higher_lows and cur.trough.price < prev.trough.price:
             return False
 
     final = seq[-1]
-    if final.depth_pct > params.max_final_depth:
+    if final.depth_for(params.price_space) > params.max_final_depth:
         return False
     if not params.allow_single_bar_final and final.bars < 2:
         return False
@@ -310,8 +306,8 @@ def _sequence_ok(seq: list[Coil], vol_ma: pd.Series, params: VCPParams) -> bool:
 
 
 def _footprint(seq: list[Coil], vol_ma: pd.Series) -> str:
-    first_pct = _depth_to_pct_label(seq[0].depth_log)
-    last_pct = _depth_to_pct_label(seq[-1].depth_log)
+    first_pct = seq[0].depth_pct * 100.0
+    last_pct = seq[-1].depth_pct * 100.0
     weeks = max(1, round((seq[-1].trough.bar - seq[0].peak.bar) / 5))
     base = vol_ma.iloc[seq[-1].trough.bar]
     vdu = seq[-1].mean_volume / base if np.isfinite(base) and base > 0 else float('nan')
@@ -418,7 +414,7 @@ def detect_vcp_breakouts(
                     pivot_price=float(seq[-1].peak.price),
                     stop_price=float(seq[-1].trough.price),
                     n_contractions=len(seq),
-                    depths=tuple(float(c.depth_log) for c in seq),
+                    depths=tuple(float(c.depth_for(params.price_space)) for c in seq),
                     volume_dryup_ratios=tuple(vdu),
                     quiet_bar_ratios=tuple(quiet),
                     breakout_rel_vol=float(rel),

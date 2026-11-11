@@ -109,7 +109,7 @@ def test_detects_synthetic_vcp_breakout():
     assert len(result.breakouts) >= 1
     bo = result.breakouts[-1]
     assert bo.n_contractions >= 2
-    assert bo.depths[0] > bo.depths[-1]
+    assert bo.depths[0] > bo.depths[-1]  # linear % depths shrink
     assert bo.breakout_vs_dryup >= params.breakout_vs_dryup_mult
     for prev, cur in zip(bo.contractions, bo.contractions[1:]):
         assert prev.recovery_peak is not None

@@ -1,9 +1,8 @@
-"""Local web viewer: type a ticker, see log history with VCP breakouts marked."""
+"""Local web viewer: type a ticker, see linear history with VCP breakouts marked."""
 
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -181,7 +180,7 @@ PAGE = r'''<!DOCTYPE html>
   <div class="wrap">
     <header>
       <h1 class="brand">VCP</h1>
-      <p class="lede">Type a ticker. See the log-scale history and every volatility contraction breakout the detector marks.</p>
+      <p class="lede">Type a ticker. See the price history and every volatility contraction breakout the detector marks.</p>
     </header>
 
     <section class="panel">
@@ -348,7 +347,8 @@ def create_app(duckdb_path: Path | None = None) -> Flask:
         events = []
         for b in result.breakouts:
             d = b.to_dict()
-            d['depths_pct'] = [round((math.exp(x) - 1) * 100.0, 2) for x in b.depths]
+            # depths are linear fractions (peak-trough)/peak when price_space='pct'
+            d['depths_pct'] = [round(x * 100.0, 2) for x in b.depths]
             events.append(d)
         payload = {
             'ticker': ticker,

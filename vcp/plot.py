@@ -1,4 +1,4 @@
-"""Log-scale history chart with VCP contraction paths and breakout markers."""
+"""Linear-scale history chart with VCP contraction paths and breakout markers."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def plot_vcp_history(
     outfile: str | Path | None = None,
     max_breakouts_labeled: int = 12,
 ) -> Path | None:
-    """Price (log) + volume with zigzag contractions and breakout markers."""
+    """Price (linear) + volume with zigzag contractions and breakout markers."""
     df = ohlcv.copy()
     df.index = pd.to_datetime(df.index)
     if df.index.tz is not None:
@@ -38,8 +38,7 @@ def plot_vcp_history(
         ax.set_facecolor('#f7f4ef')
 
     ax_px.plot(df.index, df['Close'], color='#1f2a44', lw=1.1, label='Close')
-    ax_px.set_yscale('log')
-    ax_px.set_ylabel('Price (log)')
+    ax_px.set_ylabel('Price')
 
     def _naive(ts) -> pd.Timestamp:
         t = pd.Timestamp(ts)
