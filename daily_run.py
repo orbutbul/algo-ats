@@ -6,6 +6,8 @@ Runs, independently of one another (a failure in one does not block the rest):
   2. 1-minute OHLCV for today (equities, ETFs, crypto)
   3. Fundamentals (daily-freq fields only; weekly/monthly skipped if not stale;
      includes crypto via CoinGecko now, same staleness-gated cadence)
+  4. Fear & Greed files from whit3rabbit/fear-greed-data (raw CNN JSON and the
+     combined CSV). Does not depend on the symbol screen.
 
 WSB widget data runs separately, hourly — see hourly_run.py.
 """
@@ -28,6 +30,7 @@ if sys.stderr is None:
 from utils import screen_symbols
 from extraction.ohlcv import download_daily_1min
 from extraction.fundamentals import fundamentals, FUNDAMENTALS_SPECS
+from extraction.fear_greed import update_fear_greed
 from validation import validate_screen, validate_ohlcv, validate_fundamentals, is_market_day, send_alert
 
 LOG_DIR = Path('logs')
@@ -106,6 +109,22 @@ def run():
             log.error(traceback.format_exc())
         else:
             issues += validate_fundamentals(screen)
+
+    # ------------------------------------------------------------------
+    # 4. Fear & Greed published on GitHub. Independent of the symbol screen.
+    #    The upstream job commits after the US close, often later than this
+    #    5:17 PM run, so this usually refreshes through the previous session.
+    # ------------------------------------------------------------------
+    log.info('--- Fear & Greed (GitHub) ---')
+    try:
+        for item in update_fear_greed():
+            log.info(
+                '%s: %d rows, last date %s',
+                item.path.as_posix(), item.rows, item.last_date or 'unknown',
+            )
+    except Exception:
+        errors.append('fear & greed')
+        log.error(traceback.format_exc())
 
     # ------------------------------------------------------------------
     # Summary

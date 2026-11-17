@@ -132,7 +132,10 @@ registration in 2026). `wsb_run.py` (repo root) runs it locally on a schedule in
    Daily is offset to :05 (not :00) so it can never land in the same minute as the hourly job.
    Both scripts already write their own logs and call `validation.send_alert` on failure — same
    alerting behavior Airflow's `on_failure_callback` gave, just driven by the scripts' own
-   try/except blocks instead of a scheduler.
+   try/except blocks instead of a scheduler. `daily_run.py` also downloads the whit3rabbit
+   Fear & Greed snapshot (`json/cnn_output.json` and `fear-greed.csv`) into `data/fear_greed/`.
+   That GitHub job is scheduled for 6:00 PM ET and often commits later, so the 5:17 PM run
+   usually picks up the previous session.
 8. **Confirm cron actually fires**: check `logs/cron.log` after the next scheduled hour.
 
 ## 3. Sync and wipe (run whenever you want, from your local machine)
@@ -158,12 +161,15 @@ What it does, in order (`data/wsb.duckdb` isn't part of this — WSB never runs 
    duplicated or lost.
 3. **Verify**: compares pulled vs. now-present-locally row counts per table; aborts before
    wiping anything if they don't reconcile.
-4. **Wipe**: only after a verified merge, deletes the data *tables* on the VM (not the whole
+4. **Fear & Greed**: copies `data/fear_greed/cnn_output.json` and `data/fear_greed/fear_greed.csv`
+   onto the local copies. Those are a full snapshot, not a row buffer, so they are replaced
+   locally and left on the VM. A file the VM does not have yet is skipped.
+5. **Wipe**: only after a verified merge, deletes the data *tables* on the VM (not the whole
    files) via SSH (`venv/bin/python oracle_cloud/remote_wipe.py ...`, or the Docker exec equivalent
    with `--docker`). It explicitly leaves `ohlcv_robinhood_last_run.txt`,
-   `ohlcv_robinhood_progress.json`, `ohlcv_last_run.txt`, and `news_last_run.txt` untouched, so
-   the cloud pipeline's incremental fetchers resume from where they left off instead of
-   re-fetching full history next run.
+   `ohlcv_robinhood_progress.json`, `ohlcv_last_run.txt`, `news_last_run.txt`, and the Fear &
+   Greed files untouched, so the cloud pipeline's incremental fetchers resume from where they
+   left off instead of re-fetching full history next run.
 
 No daemon or listener runs on either end — this is entirely driven by you running the script.
 

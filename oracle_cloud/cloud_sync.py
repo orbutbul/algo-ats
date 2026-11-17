@@ -1,6 +1,10 @@
 """
 oracle_cloud/cloud_sync.py — pull the Oracle Cloud VM's accumulated pipeline data
-into local data/*.duckdb, verify the merge, then wipe the cloud copy.
+into local data/*.duckdb, verify the merge, then wipe the cloud copy. It also
+copies the Fear & Greed snapshot daily_run wrote under data/fear_greed/
+(cnn_output.json and fear_greed.csv). Those files are a full-history
+download, not an incremental buffer, so they are replaced locally and left
+on the VM.
 
 Run manually, whenever you want a sync (no daemon/listener on either end):
     python oracle_cloud/cloud_sync.py --host <public-ip> --key /path/to/private_key
@@ -29,6 +33,7 @@ import duckdb
 # relative to wherever this is invoked from, run this from the repo root).
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from extraction.news import _TABLES as NEWS_TABLES  # noqa: E402
+from extraction.fear_greed import GITHUB_FILES  # noqa: E402
 
 DATA_DIR = Path('data')
 TMP_DIR = DATA_DIR / '.cloud_sync_tmp'
@@ -54,6 +59,10 @@ DB_SPECS: dict[str, dict[str, list[str]]] = {
     },
 }
 
+# Relative to data/. Written by daily_run from the whit3rabbit GitHub repo
+# and copied down here. Not listed in DB_SPECS, so remote_wipe never deletes them.
+FEAR_GREED_FILES = tuple(f'fear_greed/{name}' for name, _url in GITHUB_FILES)
+
 
 def _run(cmd: list[str]) -> None:
     print(f"  $ {' '.join(cmd)}")
@@ -66,6 +75,34 @@ def pull(host: str, key: str, user: str, port: int) -> None:
         remote = f'{user}@{host}:{REMOTE_REPO_DIR}/data/{db_name}'
         local = TMP_DIR / db_name
         _run(['scp', '-i', key, '-P', str(port), remote, str(local)])
+
+
+def _remote_file_exists(host: str, key: str, user: str, port: int, rel: str) -> bool:
+    remote_cmd = f'test -f {REMOTE_REPO_DIR}/data/{rel}'
+    result = subprocess.run(
+        ['ssh', '-i', key, '-p', str(port), f'{user}@{host}', remote_cmd],
+    )
+    return result.returncode == 0
+
+
+def pull_fear_greed(host: str, key: str, user: str, port: int) -> None:
+    """Copy the Fear & Greed files daily_run saved on the VM.
+
+    A missing remote file is skipped so a VM that has not run the new daily
+    step yet still syncs news and OHLCV. The files stay on the VM.
+    """
+    dest_dir = DATA_DIR / 'fear_greed'
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    for rel in FEAR_GREED_FILES:
+        if not _remote_file_exists(host, key, user, port, rel):
+            print(f'  data/{rel}: not on the VM yet, skipping')
+            continue
+        local_tmp = TMP_DIR / Path(rel).name
+        remote = f'{user}@{host}:{REMOTE_REPO_DIR}/data/{rel}'
+        _run(['scp', '-i', key, '-P', str(port), remote, str(local_tmp)])
+        local_tmp.replace(DATA_DIR / rel)
+        print(f'  data/{rel}: copied')
 
 
 def merge() -> dict[str, dict[str, int]]:
@@ -171,6 +208,9 @@ def main() -> None:
 
     print('Verifying merge...')
     verify(pulled_counts)
+
+    print('Copying Fear & Greed files (left on the VM)...')
+    pull_fear_greed(args.host, args.key, args.user, args.port)
 
     print('Wiping cloud data tables (bookkeeping files left untouched)...')
     wipe(args.host, args.key, args.user, args.port, args.docker)
