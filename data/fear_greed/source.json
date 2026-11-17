@@ -1,0 +1,10 @@
+{
+  "fear_greed_source": "https://github.com/whit3rabbit/fear-greed-data/blob/main/fear-greed.csv",
+  "fear_greed_file": "fear_greed.csv",
+  "joined_file": "fear_greed_sp500.csv",
+  "sp500_source": "Yahoo Finance ^GSPC daily close, price index, not total return",
+  "joined_sessions": 3969,
+  "start": "2011-01-03",
+  "end": "2026-11-16",
+  "note": "Fear & Greed before 2021-01-22 is an integer reconstruction. CNN launched the index on 2012-05-23. From 2021-02-01 the whit3rabbit file is refreshed from CNN's graph."
+}
