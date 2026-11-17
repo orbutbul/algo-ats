@@ -37,16 +37,13 @@ def plot_vcp_history(
     for ax in (ax_px, ax_vol):
         ax.set_facecolor('#f7f4ef')
 
-    if 'HLC3' not in df.columns:
-        df = df.copy()
-        df['HLC3'] = (df['High'] + df['Low'] + df['Close']) / 3.0
-    ax_px.plot(df.index, df['Close'], color='#94a3b8', lw=0.9, alpha=0.55, label='Close')
-    ax_px.plot(df.index, df['HLC3'], color='#1f2a44', lw=1.15, label='HLC3')
+    ax_px.vlines(df.index, df['Low'], df['High'], color='#64748b', lw=0.7, alpha=0.7, label='HL range')
+    ax_px.plot(df.index, df['Close'], color='#1f2a44', lw=0.9, alpha=0.75, label='Close')
     if result.params.price_space == 'log':
         ax_px.set_yscale('log')
-        ax_px.set_ylabel('Price (log HLC3)')
+        ax_px.set_ylabel('Price (log)')
     else:
-        ax_px.set_ylabel('Price (HLC3)')
+        ax_px.set_ylabel('Price')
 
     def _naive(ts) -> pd.Timestamp:
         t = pd.Timestamp(ts)

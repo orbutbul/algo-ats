@@ -209,7 +209,8 @@ PAGE = r'''<!DOCTYPE html>
           <tr>
             <th>Breakout</th>
             <th>Footprint</th>
-            <th>Pivot</th>
+            <th>Conf</th>
+            <th>Shelf</th>
             <th>Stop</th>
             <th>Depths %</th>
             <th>Coil vol / MA</th>
@@ -262,10 +263,13 @@ PAGE = r'''<!DOCTYPE html>
           for (const e of data.events) {
             const tr = document.createElement('tr');
             const vdu = (e.volume_dryup_ratios || []).map(x => (Number(x) * 100).toFixed(0) + '%').join(' → ');
+            const conf = (e.confidence == null) ? '—' : Number(e.confidence).toFixed(2);
+            const shelf = (e.shelf_price != null) ? e.shelf_price : e.pivot_price;
             tr.innerHTML = `
               <td>${e.breakout_date}</td>
               <td>${e.footprint}</td>
-              <td>${e.pivot_price.toFixed(2)}</td>
+              <td>${conf}</td>
+              <td>${Number(shelf).toFixed(2)}</td>
               <td>${e.stop_price.toFixed(2)}</td>
               <td>${e.depths_pct.map(x => x.toFixed(1)).join(' → ')}</td>
               <td>${vdu}</td>
@@ -351,7 +355,7 @@ def create_app(duckdb_path: Path | None = None) -> Flask:
             if result.params.price_space == 'log':
                 import math
 
-                d['depths_pct'] = [round((math.exp(x) - 1.0) * 100.0, 2) for x in b.depths]
+                d['depths_pct'] = [round((1.0 - math.exp(-x)) * 100.0, 2) for x in b.depths]
             else:
                 d['depths_pct'] = [round(x * 100.0, 2) for x in b.depths]
             events.append(d)

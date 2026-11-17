@@ -37,9 +37,6 @@ def build_vcp_figure(
         row_heights=[0.78, 0.22],
     )
 
-    if 'HLC3' not in df.columns:
-        df['HLC3'] = (df['High'] + df['Low'] + df['Close']) / 3.0
-
     # Daily OHLC bars (open tick left, close tick right) — Minervini chart style.
     fig.add_trace(
         go.Ohlc(
@@ -53,20 +50,6 @@ def build_vcp_figure(
             decreasing_line_color='#be185d',
             line=dict(width=1.15),
             hoverinfo='x+y',
-        ),
-        row=1,
-        col=1,
-    )
-    # Detection series overlaid so coil marks line up with what the detector sees.
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df['HLC3'],
-            mode='lines',
-            name='HLC3',
-            line=dict(color='#1b2a44', width=1.2),
-            opacity=0.55,
-            hovertemplate='%{x|%Y-%m-%d}<br>HLC3=%{y:.2f}<extra></extra>',
         ),
         row=1,
         col=1,
@@ -118,13 +101,16 @@ def build_vcp_figure(
         if result.params.price_space == 'log':
             import math
 
-            depths_pct = [round((math.exp(d) - 1.0) * 100.0, 1) for d in bo.depths]
+            depths_pct = [round((1.0 - math.exp(-d)) * 100.0, 1) for d in bo.depths]
         else:
             depths_pct = [round(d * 100.0, 1) for d in bo.depths]
+        shelf = getattr(bo, 'shelf_price', None) or bo.pivot_price
+        conf = getattr(bo, 'confidence', None)
+        conf_bit = f'{conf:.2f}' if conf is not None else '—'
         fig.add_trace(
             go.Scatter(
                 x=[bdate],
-                y=[bo.pivot_price],
+                y=[shelf],
                 mode='markers+text',
                 name=f'Breakout {bdate.date()}',
                 text=[bo.footprint],
@@ -138,8 +124,9 @@ def build_vcp_figure(
                 hovertemplate=(
                     f'<b>{bo.ticker} breakout</b><br>'
                     f'%{{x|%Y-%m-%d}}<br>'
-                    f'pivot=%{{y:.2f}}<br>'
+                    f'shelf=%{{y:.2f}}<br>'
                     f'stop={bo.stop_price:.2f}<br>'
+                    f'confidence={conf_bit}<br>'
                     f'depths%={depths_pct}<br>'
                     f'coil vol vs MA={[round(v, 2) for v in bo.volume_dryup_ratios]}<br>'
                     f'breakout vs dry-up={bo.breakout_vs_dryup:.2f}x<br>'
@@ -152,10 +139,11 @@ def build_vcp_figure(
             row=1,
             col=1,
         )
+        # Resistance shelf (shared high the excursions reclaim).
         fig.add_hline(
-            y=bo.pivot_price,
-            line=dict(color=color, width=1, dash='dot'),
-            opacity=0.45,
+            y=shelf,
+            line=dict(color=color, width=1.2, dash='dash'),
+            opacity=0.55,
             row=1,
             col=1,
         )
