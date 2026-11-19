@@ -115,15 +115,22 @@ def _pivots_from_pivotinfo(
         return None
 
     series_v = conf_value if isinstance(conf_value, pd.Series) else conf_value.iloc[:, 0]
+    # Same walk as the old per-bar np.isclose / Series.items loop. Scalar np.isclose
+    # allocates; the predicate below is np.isclose(val, prev) with the library defaults
+    # (rtol=1e-05, atol=1e-08), which apply the tolerance to prev.
+    values = np.asarray(series_v.to_numpy(dtype=np.float64, copy=False))
+    index = series_v.index
     pivots: list[Pivot] = []
-    prev = np.nan
-    for i, (ts, val) in enumerate(series_v.items()):
-        if pd.isna(val) or (isinstance(prev, float) and not np.isnan(prev) and np.isclose(val, prev)):
-            prev = float(val) if not pd.isna(val) else prev
+    prev = float('nan')
+    for i in range(int(values.size)):
+        val = float(values[i])
+        if val != val or (prev == prev and abs(val - prev) <= (1e-08 + 1e-05 * abs(prev))):
+            if val == val:
+                prev = val
             continue
-        kind: PivotKind = 'high' if (np.isnan(prev) or val >= prev) else 'low'
-        pivots.append(Pivot(index=ts, price=float(val), kind=kind, bar=i))
-        prev = float(val)
+        kind: PivotKind = 'high' if (prev != prev or val >= prev) else 'low'
+        pivots.append(Pivot(index=index[i], price=val, kind=kind, bar=i))
+        prev = val
 
     fixed: list[Pivot] = []
     for p in pivots:

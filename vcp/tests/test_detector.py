@@ -116,6 +116,23 @@ def test_build_coils_are_contiguous_peak_trough_recovery():
     assert coils[2].peak.bar == coils[1].recovery_peak.bar
 
 
+def test_excursion_rejects_a_high_above_the_shelf_cap():
+    idx = pd.bdate_range('2024-01-02', periods=8, tz='UTC')
+    volume = np.full(8, 1_000_000.0)
+    params = VCPParams(shelf_overshoot=0.01, shelf_tol=0.03, min_excursion_bars=2)
+    clean_high = np.array([100, 96, 90, 80, 90, 96, 100, 100], dtype=float)
+    clean = build_excursions_under_shelf(
+        clean_high, clean_high * 0.98, volume, idx, 0, 100.0, params
+    )
+    assert len(clean) == 1
+    spiked_high = clean_high.copy()
+    spiked_high[4] = 112.0
+    spiked = build_excursions_under_shelf(
+        spiked_high, spiked_high * 0.98, volume, idx, 0, 100.0, params
+    )
+    assert spiked == []
+
+
 def test_shelf_excursions_ignore_intra_pullback_noise():
     df = _synthetic_shelf_vcp()
     high = df['High'].to_numpy(dtype=float)

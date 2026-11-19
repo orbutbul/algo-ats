@@ -307,6 +307,11 @@ def build_excursions_under_shelf(
         gap_hi = return_i
         if gap_hi <= gap_lo:
             continue
+        # The shelf is the level before the contraction. Price has to stay under
+        # it (plus the overshoot cap) until it comes back; a higher high breaks it.
+        ceiling = shelf * (1.0 + params.shelf_overshoot)
+        if float(np.max(high[gap_lo:gap_hi])) > ceiling:
+            continue
         trough_off = int(np.argmin(low[gap_lo:gap_hi]))
         trough_i = gap_lo + trough_off
         if trough_i - leave_i < params.min_excursion_bars and (return_i - leave_i) < params.min_excursion_bars:

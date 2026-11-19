@@ -11,7 +11,17 @@ from plotly.utils import PlotlyJSONEncoder
 from vcp.detector import detect_vcp_breakouts
 from vcp.io import OHLCV_DUCKDB_PATH, list_tickers, load_daily_ohlcv, seed_daily_ohlcv
 from vcp.params import VCPParams
+from vcp.plan_page import PLAN_PAGE
 from vcp.plotly_chart import build_vcp_figure
+
+# Stronger 20-bar cell from the 4x4x4 grid. Other gates stay at VCPParams defaults.
+VIEW_PARAMS = VCPParams(
+    contraction_ratio=0.60,
+    shelf_tol=0.040,
+    noise_depth_frac=0.50,
+    shelf_overshoot=0.01,
+)
+WATCHLIST_PATH = Path(__file__).resolve().parents[1] / 'artifacts' / 'vcp_viewer_hits.json'
 
 PAGE = r'''<!DOCTYPE html>
 <html lang="en">
@@ -45,7 +55,7 @@ PAGE = r'''<!DOCTYPE html>
         linear-gradient(165deg, #ebe4d6 0%, var(--paper) 45%, #e7eef0 100%);
     }
     .wrap {
-      width: min(1180px, calc(100% - 2rem));
+      width: min(1400px, calc(100% - 2rem));
       margin: 0 auto;
       padding: 1.6rem 0 2.5rem;
     }
@@ -130,8 +140,46 @@ PAGE = r'''<!DOCTYPE html>
       font-size: 0.82rem;
       font-weight: 600;
     }
-    #chart {
+    .stage {
+      display: grid;
+      grid-template-columns: 300px minmax(0, 1fr);
+      gap: 0.9rem;
+      align-items: start;
       margin-top: 0.9rem;
+    }
+    .hits-panel { padding: 0.75rem; }
+    .hit-list {
+      max-height: 720px;
+      overflow: auto;
+      margin-top: 0.45rem;
+    }
+    button.hit-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.1rem 0.6rem;
+      width: 100%;
+      padding: 0.45rem 0.4rem;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      font: 600 0.92rem "IBM Plex Sans", Helvetica, sans-serif;
+      cursor: pointer;
+      transform: none;
+    }
+    button.hit-row:hover { background: rgba(15, 106, 79, 0.08); transform: none; }
+    button.hit-row.active { background: rgba(15, 106, 79, 0.14); }
+    .hit-row .when { color: var(--muted); font-weight: 500; }
+    .hit-row .sub {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 400;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    #chart {
       min-height: 720px;
       background: rgba(255,252,245,0.55);
       border: 1px solid var(--line);
@@ -173,6 +221,8 @@ PAGE = r'''<!DOCTYPE html>
     @media (max-width: 820px) {
       form.controls { grid-template-columns: 1fr 1fr; }
       form.controls button { grid-column: 1 / -1; }
+      .stage { grid-template-columns: 1fr; }
+      .hit-list { max-height: 280px; }
     }
   </style>
 </head>
@@ -180,16 +230,16 @@ PAGE = r'''<!DOCTYPE html>
   <div class="wrap">
     <header>
       <h1 class="brand">VCP</h1>
-      <p class="lede">Type a ticker. See the price history and every volatility contraction breakout the detector marks.</p>
+      <p class="lede">Charts use contraction ratio 0.60, shelf tolerance 0.040, and noise fraction 0.50. A contraction starts at the shelf and may not trade more than 1% above it. <a href="/plan">Sweep planner</a></p>
     </header>
 
     <section class="panel">
       <form class="controls" id="form">
         <label>Ticker
-          <input id="ticker" name="ticker" value="NVDA" autocomplete="off" spellcheck="false" />
+          <input id="ticker" name="ticker" value="" placeholder="Ticker" autocomplete="off" spellcheck="false" />
         </label>
         <label>Start
-          <input id="start" name="start" type="date" value="2018-01-01" />
+          <input id="start" name="start" type="date" value="2015-10-06" />
         </label>
         <label>End
           <input id="end" name="end" type="date" />
@@ -197,11 +247,20 @@ PAGE = r'''<!DOCTYPE html>
         <button id="go" type="submit">Show VCP</button>
       </form>
       <div class="meta" id="meta">
-        <span class="hint">Loaded tickers: {{ tickers }}</span>
+        <span class="hint">Pick a name from the list, or type one.</span>
       </div>
       <div class="error" id="error"></div>
     </section>
 
+    <div class="stage">
+      <aside class="panel hits-panel">
+        <label>Names with a VCP
+          <input id="filter" placeholder="Filter ticker" autocomplete="off" spellcheck="false" />
+        </label>
+        <p class="hint" id="hit-count"></p>
+        <div class="hit-list" id="hit-list"></div>
+      </aside>
+      <div>
     <div id="chart"></div>
     <div class="table-wrap" id="table-wrap" style="display:none">
       <table>
@@ -221,6 +280,8 @@ PAGE = r'''<!DOCTYPE html>
         <tbody id="tbody"></tbody>
       </table>
     </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -230,6 +291,44 @@ PAGE = r'''<!DOCTYPE html>
     const goBtn = document.getElementById('go');
     const tableWrap = document.getElementById('table-wrap');
     const tbody = document.getElementById('tbody');
+    const hitList = document.getElementById('hit-list');
+    const hitCount = document.getElementById('hit-count');
+    const filterEl = document.getElementById('filter');
+    let watchlist = [];
+
+    function renderHits() {
+      const query = filterEl.value.trim().toUpperCase();
+      const shown = watchlist.filter((row) => row.ticker.includes(query));
+      const current = document.getElementById('ticker').value.trim().toUpperCase();
+      hitCount.textContent = shown.length + ' of ' + watchlist.length + ' names';
+      hitList.innerHTML = '';
+      for (const row of shown) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'hit-row' + (row.ticker === current ? ' active' : '');
+        const latest = row.hits[row.hits.length - 1];
+        button.innerHTML = `
+          <span>${row.ticker}</span>
+          <span class="when">${row.latest}</span>
+          <span class="sub">${row.n} pattern${row.n === 1 ? '' : 's'} · ${latest.footprint}</span>
+        `;
+        button.addEventListener('click', () => {
+          document.getElementById('ticker').value = row.ticker;
+          loadChart();
+        });
+        hitList.appendChild(button);
+      }
+    }
+
+    async function loadWatchlist() {
+      const res = await fetch('/api/watchlist');
+      const data = await res.json();
+      watchlist = data.tickers || [];
+      if (watchlist.length && !document.getElementById('ticker').value.trim()) {
+        document.getElementById('ticker').value = watchlist[0].ticker;
+      }
+      renderHits();
+    }
 
     async function loadChart() {
       errorEl.style.display = 'none';
@@ -255,7 +354,7 @@ PAGE = r'''<!DOCTYPE html>
           <span class="chip">${data.ticker}</span>
           <span><strong>${data.breakouts}</strong> VCP breakout(s)</span>
           <span>${data.bars} daily bars</span>
-          <span>${data.seeded ? 'seeded on demand' : 'from local duckdb'}</span>
+          <span>contraction 0.60 · shelf 0.040 · noise 0.50 · 1% above shelf</span>
         `;
         tbody.innerHTML = '';
         if (data.events.length) {
@@ -288,6 +387,7 @@ PAGE = r'''<!DOCTYPE html>
       } finally {
         goBtn.disabled = false;
         goBtn.textContent = 'Show VCP';
+        renderHits();
       }
     }
 
@@ -295,7 +395,8 @@ PAGE = r'''<!DOCTYPE html>
       ev.preventDefault();
       loadChart();
     });
-    loadChart();
+    filterEl.addEventListener('input', renderHits);
+    loadWatchlist().then(loadChart);
   </script>
 </body>
 </html>
@@ -307,13 +408,19 @@ def create_app(duckdb_path: Path | None = None) -> Flask:
     app = Flask(__name__)
     app.config['VCP_DUCKDB'] = duckdb_path
 
+    @app.get('/plan')
+    def plan():
+        return Response(PLAN_PAGE, mimetype='text/html')
+
     @app.get('/')
     def index():
-        try:
-            tickers = ', '.join(list_tickers(duckdb_path)) or '(none yet — type a ticker to seed)'
-        except Exception:
-            tickers = '(no duckdb yet — type a ticker to seed)'
-        return render_template_string(PAGE, tickers=tickers)
+        return render_template_string(PAGE)
+
+    @app.get('/api/watchlist')
+    def api_watchlist():
+        if not WATCHLIST_PATH.exists():
+            return jsonify({'tickers': [], 'error': f'missing {WATCHLIST_PATH.name}'}), 200
+        return Response(WATCHLIST_PATH.read_text(encoding='utf-8'), mimetype='application/json')
 
     @app.get('/api/tickers')
     def api_tickers():
@@ -346,7 +453,7 @@ def create_app(duckdb_path: Path | None = None) -> Flask:
         except Exception as exc:
             return jsonify({'error': str(exc)}), 500
 
-        result = detect_vcp_breakouts(ohlcv, ticker=ticker, params=VCPParams())
+        result = detect_vcp_breakouts(ohlcv, ticker=ticker, params=VIEW_PARAMS)
         fig = build_vcp_figure(ohlcv, result)
         events = []
         for b in result.breakouts:

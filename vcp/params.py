@@ -33,8 +33,9 @@ class VCPParams:
     # --- Shelf / excursion structure ---
     # Return high is "around" the shelf if within this fraction of shelf price.
     shelf_tol: float = 0.025
-    # Allow a touch slightly above the left-side high before treating it as broken.
-    shelf_overshoot: float = 0.015
+    # Every high in a contraction, including the return, may print at most this
+    # far above the shelf. A push beyond it breaks the level.
+    shelf_overshoot: float = 0.01
     # Excursions shallower than this fraction of the *first* depth are noise-scale.
     noise_depth_frac: float = 0.33
     # Minimum bars from leave high → trough (filters 1-bar flicker).
